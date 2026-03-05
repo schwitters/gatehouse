@@ -1,2 +1,3 @@
 build/
 gatehouse.db
+build-asan/

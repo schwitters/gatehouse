@@ -72,8 +72,10 @@ find_package(SQLite3 REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(KRB5 REQUIRED krb5)
+pkg_check_modules(LDAP REQUIRED ldap)
 
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 
 # ----------------------------
 # Main target
@@ -82,6 +84,11 @@ add_executable(gatehouse
   src/main.cc
   src/app/http_server.cc
   src/app/auth.cc
+  src/app/email_sender.cc
+  src/infra/invite_repo.cc
+  src/infra/invite_session_repo.cc
+  src/infra/ldif_directory.cc
+  src/core/sha256.cc
 
   src/core/hex.cc
   src/core/random.cc
@@ -92,6 +99,7 @@ add_executable(gatehouse
   src/infra/migrate.cc
   src/infra/session_repo.cc
   src/infra/krb5_client.cc
+  src/infra/ldap_directory.cc
   src/infra/ticket_vault_read.cc
   src/infra/xrdp_otp_repo.cc
   src/infra/cred_fetch_token_repo.cc
@@ -133,3 +141,10 @@ target_link_libraries(gatehouse PRIVATE ${KRB5_LIBRARIES})
 target_compile_options(gatehouse PRIVATE ${KRB5_CFLAGS_OTHER})
 
 target_link_libraries(gatehouse PRIVATE OpenSSL::Crypto)
+
+# OpenLDAP (pkg-config)
+target_include_directories(gatehouse SYSTEM PRIVATE ${LDAP_INCLUDE_DIRS})
+target_link_directories(gatehouse PRIVATE ${LDAP_LIBRARY_DIRS})
+target_link_libraries(gatehouse PRIVATE ${LDAP_LIBRARIES})
+target_compile_options(gatehouse PRIVATE ${LDAP_CFLAGS_OTHER})
+target_link_libraries(gatehouse PRIVATE CURL::libcurl)

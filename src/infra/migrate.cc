@@ -3,7 +3,6 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <utility>
 
 namespace gatehouse::infra {
 namespace {
@@ -46,11 +45,8 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
   if (v.value() == 0) {
     auto sql = ReadFileToString(cfg.schema_v1_path);
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
-
     auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
-
-    // v1 file should set PRAGMA user_version=1, but ensure:
     rc = db.SetPragmaUserVersion(1);
     if (!rc.ok()) return rc;
     v = db.GetPragmaUserVersion();
@@ -60,11 +56,31 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
   if (v.value() == 1) {
     auto sql = ReadFileToString(cfg.schema_v2_path);
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
-
     auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
-
     rc = db.SetPragmaUserVersion(2);
+    if (!rc.ok()) return rc;
+    v = db.GetPragmaUserVersion();
+    if (!v.ok()) return core::Result<void>::Err(v.status());
+  }
+
+  if (v.value() == 2) {
+    auto sql = ReadFileToString(cfg.schema_v3_path);
+    if (!sql.ok()) return core::Result<void>::Err(sql.status());
+    auto rc = ExecTx(db, sql.value());
+    if (!rc.ok()) return rc;
+    rc = db.SetPragmaUserVersion(3);
+    if (!rc.ok()) return rc;
+    v = db.GetPragmaUserVersion();
+    if (!v.ok()) return core::Result<void>::Err(v.status());
+  }
+
+  if (v.value() == 3) {
+    auto sql = ReadFileToString(cfg.schema_v4_path);
+    if (!sql.ok()) return core::Result<void>::Err(sql.status());
+    auto rc = ExecTx(db, sql.value());
+    if (!rc.ok()) return rc;
+    rc = db.SetPragmaUserVersion(4);
     if (!rc.ok()) return rc;
   }
 

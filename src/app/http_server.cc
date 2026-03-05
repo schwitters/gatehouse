@@ -1,6 +1,7 @@
 #include "app/http_server.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -9,65 +10,34 @@
 #include <vector>
 
 #include "app/auth.h"
+#include "app/email_sender.h"
 #include "core/crypto_aead.h"
 #include "core/hex.h"
 #include "core/random.h"
+#include "core/sha256.h"
 #include "core/time.h"
 #include "core/url.h"
 #include "crow.h"
 #include "crow/json.h"
-#include "infra/cred_fetch_token_repo.h"
+#include "infra/invite_repo.h"
+#include "infra/invite_session_repo.h"
+#include "infra/ldap_directory.h"
+#include "infra/ldif_directory.h"
 #include "infra/session_repo.h"
 #include "infra/sqlite_db.h"
-#include "infra/ticket_vault_read.h"
 #include "infra/ticket_vault_repo.h"
-#include "infra/xrdp_otp_repo.h"
 
 namespace gatehouse::core {
-
 std::string Status::ToString() const {
   if (ok()) return "OK";
   return "ERR(" + std::to_string(static_cast<std::uint32_t>(code_)) + "): " + message_;
 }
-
 }  // namespace gatehouse::core
 
 namespace gatehouse::app {
 namespace {
 
-constexpr const char* kHtmlLogin = R"(<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gatehouse Login</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:520px}
-    label{display:block;margin-top:16px}
-    input{width:100%;padding:10px;margin-top:6px}
-    button{margin-top:16px;padding:10px 14px}
-    .err{color:#b00020;margin-top:10px}
-    .hint{color:#555;margin-top:8px;font-size:0.9em}
-    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
-  </style>
-</head>
-<body>
-  <h1>Gatehouse</h1>
-  <p class="hint">Temporary demo login: <code>demo</code> / <code>demo</code></p>
-
-  <form method="post" action="/auth/login">
-    <label>Username
-      <input name="username" autocomplete="username" required>
-    </label>
-    <label>Password
-      <input name="password" type="password" autocomplete="current-password" required>
-    </label>
-    <button type="submit">Sign in</button>
-  </form>
-
-  %ERROR%
-</body>
-</html>)";
+constexpr const char* kInviteCookie = "gh_inv_sid";
 
 std::string CookieValueFromHeader(const crow::request& req, const std::string& cookie_name) {
   const std::string cookie = req.get_header_value("Cookie");
@@ -104,6 +74,13 @@ crow::response Json(int code, const crow::json::wvalue& v) {
   return r;
 }
 
+bool IsAdminUid(const std::vector<std::string>& allow, const std::string& uid) {
+  for (const auto& a : allow) {
+    if (a == uid) return true;
+  }
+  return false;
+}
+
 core::Result<std::vector<std::uint8_t>> LoadMasterKeyFromEnv() {
   const char* p = std::getenv("GATEHOUSE_MASTER_KEY_HEX");
   if (p == nullptr || std::string(p).empty()) {
@@ -121,20 +98,9 @@ core::Result<std::vector<std::uint8_t>> LoadMasterKeyFromEnv() {
   return key;
 }
 
-core::Result<std::string> LoadInternalSecretFromEnv() {
-  const char* p = std::getenv("GATEHOUSE_INTERNAL_SECRET");
-  if (p == nullptr || std::string(p).empty()) {
-    return core::Result<std::string>::Err(core::Status::Error(
-        core::StatusCode::kFailedPrecondition,
-        "GATEHOUSE_INTERNAL_SECRET not set (shared secret for internal XRDP endpoints)"));
-  }
-  return core::Result<std::string>::Ok(std::string(p));
-}
-
-core::Result<std::string> StoreTicketIfPresent(
-    infra::TicketVaultRepo& vault,
-    const std::vector<std::uint8_t>& master_key,
-    const LoginPrincipal& principal) {
+core::Result<std::string> StoreTicketIfPresent(infra::TicketVaultRepo& vault,
+                                               const std::vector<std::uint8_t>& master_key,
+                                               const LoginPrincipal& principal) {
   if (principal.ccache_blob.empty()) return core::Result<std::string>::Ok(std::string{});
 
   auto ticket_id_bytes = core::RandomBytes(16);
@@ -165,12 +131,232 @@ core::Result<std::string> StoreTicketIfPresent(
   return core::Result<std::string>::Ok(ticket_id);
 }
 
-bool ConstantTimeEq(const std::string& a, const std::string& b) {
-  if (a.size() != b.size()) return false;
-  unsigned char v = 0;
-  for (std::size_t i = 0; i < a.size(); ++i) v |= static_cast<unsigned char>(a[i] ^ b[i]);
-  return v == 0;
+std::string InviteStatusName(infra::InviteStatus s) {
+  switch (s) {
+    case infra::InviteStatus::kInvited: return "Invited";
+    case infra::InviteStatus::kLinkVerified: return "LinkVerified";
+    case infra::InviteStatus::kStepupSent: return "StepupSent";
+    case infra::InviteStatus::kStepupVerified: return "StepupVerified";
+    case infra::InviteStatus::kCompleted: return "Completed";
+    case infra::InviteStatus::kExpired: return "Expired";
+    case infra::InviteStatus::kRevoked: return "Revoked";
+  }
+  return "Unknown";
 }
+
+const char* kLoginPageTemplate = R"LOGIN(<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gatehouse Login</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:640px}
+label{display:block;margin-top:16px} input{width:100%;padding:10px;margin-top:6px}
+button{margin-top:16px;padding:10px 14px}
+.err{color:#b00020;margin-top:10px}
+.hint{color:#555;margin-top:8px;font-size:0.9em}
+code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+</style></head>
+<body>
+<h1>Gatehouse</h1>
+<p class="hint">Temporary demo login: <code>demo</code> / <code>demo</code></p>
+<form method="post" action="/auth/login">
+  <label>Username <input name="username" autocomplete="username" required></label>
+  <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+  <button type="submit">Sign in</button>
+</form>
+%ERROR%
+</body></html>)LOGIN";
+
+const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gatehouse Admin – Invitations</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:980px}
+    label{display:block;margin-top:14px}
+    input{width:100%;padding:10px;margin-top:6px}
+    button{margin-top:12px;padding:10px 14px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .card{padding:16px;border:1px solid #ddd;border-radius:12px;margin-top:18px}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+    pre{background:#0b1020;color:#e6e6e6;padding:12px;border-radius:12px;overflow:auto}
+    .ok{color:#0a7a2f}
+    .err{color:#b00020}
+    a{color:#0b57d0}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;font-size:14px}
+    th{font-weight:600}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f4f4f4}
+  </style>
+</head>
+<body>
+  <h1>Invitations</h1>
+  <p><a href="/portal">Back to portal</a></p>
+
+  <div class="card">
+    <h2>Create invite</h2>
+    <div class="row">
+      <div>
+        <label>Tenant OU (e.g. <code>k8s-20260118</code>)
+          <input id="tenant_ou" placeholder="k8s-20260118" autocomplete="off">
+        </label>
+      </div>
+      <div>
+        <label>User UID (e.g. <code>krm</code>)
+          <input id="uid" placeholder="krm" autocomplete="off">
+        </label>
+      </div>
+    </div>
+    <button id="btnCreate">Create invite</button>
+    <p id="statusCreate"></p>
+    <div id="outCreate"></div>
+  </div>
+
+  <div class="card">
+    <h2>Latest invites</h2>
+    <div class="row">
+      <div>
+        <label>Filter tenant_ou
+          <input id="fltTenant" placeholder="(optional)">
+        </label>
+      </div>
+      <div>
+        <label>Filter uid
+          <input id="fltUid" placeholder="(optional)">
+        </label>
+      </div>
+    </div>
+    <button id="btnRefresh">Refresh list</button>
+    <p id="statusList"></p>
+    <div id="list"></div>
+  </div>
+
+<script>
+async function apiJson(method, path, body) {
+  const opt = {method, headers: {"Content-Type":"application/json"}};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const t = await r.text();
+  let j = null;
+  try { j = JSON.parse(t); } catch(e) {}
+  return {ok: r.ok, status: r.status, json: j, text: t};
+}
+
+function setStatus(id, kind, msg) {
+  const el = document.getElementById(id);
+  el.className = kind;
+  el.textContent = msg;
+}
+
+function renderJson(where, obj) {
+  const out = document.getElementById(where);
+  out.innerHTML = "";
+  const pre = document.createElement("pre");
+  pre.textContent = JSON.stringify(obj, null, 2);
+  out.appendChild(pre);
+  if (obj && obj.invite_url) {
+    const p = document.createElement("p");
+    const a = document.createElement("a");
+    a.href = obj.invite_url;
+    a.textContent = "Open invite link";
+    a.target = "_blank";
+    p.appendChild(a);
+    out.appendChild(p);
+  }
+}
+
+function renderList(items) {
+  const root = document.getElementById("list");
+  root.innerHTML = "";
+  if (!items || items.length === 0) {
+    root.textContent = "No invites.";
+    return;
+  }
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>created</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>expires</th><th>actions</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    const created = new Date(it.created_at * 1000).toLocaleString();
+    const expires = new Date(it.expires_at * 1000).toLocaleString();
+    tr.innerHTML =
+      "<td>" + created + "</td>" +
+      "<td><code>" + it.tenant_id + "</code></td>" +
+      "<td><code>" + (it.invited_uid||"") + "</code></td>" +
+      "<td>" + it.invited_email + "</td>" +
+      "<td><span class='pill'>" + it.status_name + "</span></td>" +
+      "<td>" + expires + "</td>" +
+      "<td></td>";
+    const td = tr.querySelectorAll("td")[6];
+
+    const btnRevoke = document.createElement("button");
+    btnRevoke.textContent = "Revoke";
+    btnRevoke.style.marginRight = "8px";
+    btnRevoke.onclick = async () => {
+      const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
+      if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
+      await refresh();
+    };
+    td.appendChild(btnRevoke);
+
+    const btnResend = document.createElement("button");
+    btnResend.textContent = "Resend (new invite)";
+    btnResend.onclick = async () => {
+      const r = await apiJson("POST", "/api/admin/invites", {tenant_ou: it.tenant_id, uid: it.invited_uid});
+      if (!r.ok) { alert("Resend failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
+      renderJson("outCreate", r.json || {});
+      setStatus("statusCreate", "ok", "Resent as new invite.");
+      await refresh();
+    };
+    td.appendChild(btnResend);
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+
+async function refresh() {
+  setStatus("statusList", "", "Loading...");
+  const t = document.getElementById("fltTenant").value.trim();
+  const u = document.getElementById("fltUid").value.trim();
+  const q = new URLSearchParams();
+  if (t) q.set("tenant_id", t);
+  if (u) q.set("invited_uid", u);
+  const r = await fetch("/api/admin/invites/list?" + q.toString());
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    setStatus("statusList", "err", "Error (" + r.status + ")");
+    return;
+  }
+  setStatus("statusList", "ok", "Loaded " + (j.items ? j.items.length : 0) + " invite(s).");
+  renderList(j.items || []);
+}
+
+document.getElementById("btnCreate").addEventListener("click", async () => {
+  const tenant_ou = document.getElementById("tenant_ou").value.trim();
+  const uid = document.getElementById("uid").value.trim();
+  if (!tenant_ou || !uid) { setStatus("statusCreate","err","tenant_ou and uid are required"); return; }
+  setStatus("statusCreate","", "Working...");
+  const r = await apiJson("POST", "/api/admin/invites", {tenant_ou, uid});
+  if (!r.ok) {
+    setStatus("statusCreate","err","Error ("+r.status+"): " + (r.json && r.json.error ? r.json.error : r.text));
+    if (r.json) renderJson("outCreate", r.json);
+    return;
+  }
+  setStatus("statusCreate","ok","Invite created and email queued/sent.");
+  renderJson("outCreate", r.json || {});
+  await refresh();
+});
+
+document.getElementById("btnRefresh").addEventListener("click", refresh);
+refresh();
+</script>
+</body>
+</html>)ADMIN";
 
 }  // namespace
 
@@ -191,19 +377,41 @@ core::Result<void> HttpServer::Run() {
     if (!mk.ok()) return core::Result<void>::Err(mk.status());
     const std::vector<std::uint8_t> master_key = std::move(mk.value());
 
-    auto isec = LoadInternalSecretFromEnv();
-    if (!isec.ok()) return core::Result<void>::Err(isec.status());
-    const std::string internal_secret = std::move(isec.value());
+    // Directory (LDAP preferred)
+    std::optional<infra::LdapDirectory> ldap_dir;
+    infra::LdifDirectory ldif_dir;
+    if (!cfg_.ldap_url.empty()) {
+      infra::LdapConfig lc;
+      lc.url = cfg_.ldap_url;
+      lc.bind_dn = cfg_.ldap_bind_dn;
+      lc.bind_pw = cfg_.ldap_bind_pw;
+      lc.base_dn = cfg_.ldap_base_dn;
+      lc.starttls = cfg_.ldap_starttls;
+      ldap_dir.emplace(lc);
+    } else if (!cfg_.ldif_path.empty()) {
+      auto rc = ldif_dir.LoadFile(cfg_.ldif_path);
+      if (!rc.ok()) return core::Result<void>::Err(rc.status());
+    }
+
+    std::unique_ptr<IEmailSender> email;
+    if (cfg_.email_backend == "curl") {
+      email = std::make_unique<CurlSmtpsEmailSender>();
+    } else {
+      email = std::make_unique<ConsoleEmailSender>();
+    }
 
     AuthService auth(cfg_.auth_cfg);
 
     infra::SessionRepo sessions(*db_);
     infra::TicketVaultRepo vault(*db_);
-    infra::TicketVaultReadRepo vault_read(*db_);
-    infra::CredFetchTokenRepo cft_repo(*db_);
-    infra::XrdpOtpRepo xrdp_otp_repo(*db_);
+    infra::InviteRepo invites(*db_);
+    infra::InviteSessionRepo invite_sessions(*db_);
+    infra::InviteProfileRepo invite_profiles(*db_);
 
-    auto gc_sessions = [&sessions] { (void)sessions.DeleteExpired(core::UnixNow()); };
+    auto gc_sessions = [&] {
+      (void)sessions.DeleteExpired(core::UnixNow());
+      (void)invite_sessions.DeleteExpired(core::UnixNow());
+    };
 
     auto require_auth = [&](const crow::request& req) -> std::optional<infra::SessionRow> {
       gc_sessions();
@@ -216,16 +424,19 @@ core::Result<void> HttpServer::Run() {
       return row;
     };
 
-    // ---------------- Public ----------------
-    CROW_ROUTE(app, "/favicon.ico").methods("GET"_method)([] { return crow::response(204); });
+    auto require_invite_session = [&](const crow::request& req) -> std::optional<infra::InviteSessionRow> {
+      gc_sessions();
+      const std::string sid = CookieValueFromHeader(req, kInviteCookie);
+      if (sid.empty()) return std::nullopt;
+      auto got = invite_sessions.GetBySid(sid);
+      if (!got.ok() || !got.value().has_value()) return std::nullopt;
+      const infra::InviteSessionRow& row = *got.value();
+      if (row.expires_at <= core::UnixNow()) return std::nullopt;
+      if (row.consumed_at != 0) return std::nullopt;
+      return row;
+    };
 
-    CROW_ROUTE(app, "/healthz").methods("GET"_method)([this] {
-      crow::json::wvalue v;
-      v["status"] = "ok";
-      v["db"] = (db_ != nullptr) && db_->is_open();
-      return Json(200, v);
-    });
-
+    // ---- health ----
     CROW_ROUTE(app, "/api/healthz").methods("GET"_method)([this] {
       crow::json::wvalue v;
       v["status"] = "ok";
@@ -233,9 +444,10 @@ core::Result<void> HttpServer::Run() {
       return Json(200, v);
     });
 
+    // ---- HTML login ----
     CROW_ROUTE(app, "/login").methods("GET"_method)([](const crow::request& req) {
       const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
-      std::string page = kHtmlLogin;
+      std::string page = kLoginPageTemplate;
       if (!err.empty()) {
         const std::string block = std::string("<div class=\"err\">") + crow::json::escape(err) + "</div>";
         const std::size_t pos = page.find("%ERROR%");
@@ -250,7 +462,7 @@ core::Result<void> HttpServer::Run() {
     CROW_ROUTE(app, "/auth/logout").methods("POST"_method)([&](const crow::request& req) {
       const std::string sid = CookieValueFromHeader(req, cfg_.session_cookie_name);
       if (!sid.empty()) (void)sessions.DeleteBySid(sid);
-      crow::response r = RedirectTo("/login");
+      auto r = RedirectTo("/login");
       r.add_header("Set-Cookie", cfg_.session_cookie_name + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
       return r;
     });
@@ -265,8 +477,8 @@ core::Result<void> HttpServer::Run() {
 
       auto vr = auth.Verify(lr);
       if (!vr.ok() || !vr.value().has_value()) return RedirectTo("/login?err=Invalid+credentials");
-      const LoginPrincipal& principal = *vr.value();
 
+      const LoginPrincipal& principal = *vr.value();
       auto ticket_id = StoreTicketIfPresent(vault, master_key, principal);
       if (!ticket_id.ok()) return RedirectTo("/login?err=Internal+error");
 
@@ -286,7 +498,7 @@ core::Result<void> HttpServer::Run() {
       auto ins = sessions.Insert(row, csrf_bytes.value());
       if (!ins.ok()) return RedirectTo("/login?err=Internal+error");
 
-      crow::response r = RedirectTo("/portal");
+      auto r = RedirectTo("/portal");
       r.add_header("Set-Cookie",
                    cfg_.session_cookie_name + "=" + row.sid +
                        "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
@@ -294,22 +506,28 @@ core::Result<void> HttpServer::Run() {
       return r;
     });
 
-    // ---------------- Protected UI ----------------
+    // ---- portal ----
     CROW_ROUTE(app, "/portal").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) return RedirectTo("/login");
-      crow::response r;
-      r.code = 200;
-      r.set_header("Content-Type", "text/html; charset=utf-8");
-      r.body =
-          "<!doctype html><html><head><meta charset=\"utf-8\"><title>Gatehouse</title></head>"
-          "<body><h1>Gatehouse Portal</h1>"
+
+      const bool is_admin = IsAdminUid(cfg_.admin_uids, s->uid);
+      std::string admin_block;
+      if (is_admin) {
+        admin_block = "<p><b>Admin</b>: <a href=\"/admin/invites\">Create & manage invitations</a></p>";
+      }
+
+      const std::string html =
+          "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          "<title>Gatehouse</title></head>"
+          "<body style=\"font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px\">"
+          "<h1>Gatehouse Portal</h1>"
           "<p>Signed in as <b>" + crow::json::escape(s->uid) + "</b></p>"
-          "<p>Session ticket_id: <code>" + crow::json::escape(s->ticket_id) + "</code></p>"
-          "<form method=\"post\" action=\"/auth/logout\"><button type=\"submit\">Logout</button></form>"
-          "<p>New: XRDP OTP Gate -> <code>/api/portal/connect</code> returns otp + fetch token.</p>"
+          "<p>Tenant: <b>" + crow::json::escape(s->tenant_id) + "</b></p>" +
+          admin_block +
+          "<form method=\"post\" action=\"/auth/logout\"><button type=\"submit\" style=\"padding:10px 14px\">Logout</button></form>"
           "</body></html>";
-      return r;
+      return HtmlPage(200, html);
     });
 
     CROW_ROUTE(app, "/").methods("GET"_method)([&](const crow::request& req) {
@@ -318,7 +536,117 @@ core::Result<void> HttpServer::Run() {
       return RedirectTo("/portal");
     });
 
-    // ---------------- JSON API ----------------
+    // ---- admin ui ----
+    CROW_ROUTE(app, "/admin/invites").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) return RedirectTo("/login");
+      if (!IsAdminUid(cfg_.admin_uids, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
+      return HtmlPage(200, kAdminInvitesPage);
+    });
+
+    // ---- invite accept -> invite_session cookie -> /invite/complete ----
+    CROW_ROUTE(app, "/invite/accept").methods("GET"_method)([&](const crow::request& req) {
+      const char* t = req.url_params.get("token");
+      if (t == nullptr) return HtmlPage(400, "<h1>Invalid invitation</h1>");
+      const std::string token_hex = t;
+
+      auto token_bytes = core::HexDecode(token_hex);
+      if (!token_bytes.ok()) return HtmlPage(400, "<h1>Invalid invitation token</h1>");
+
+      auto hash = core::Sha256(token_bytes.value());
+      if (!hash.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      auto row = invites.GetByTokenHash(hash.value());
+      if (!row.ok() || !row.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+
+      const auto now = core::UnixNow();
+      const auto& inv = *row.value();
+
+      if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) return HtmlPage(410, "<h1>Invitation revoked</h1>");
+      if (inv.expires_at <= now) return HtmlPage(410, "<h1>Invitation expired</h1>");
+
+      (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kLinkVerified, now);
+
+      auto sid_bytes = core::RandomBytes(32);
+      if (!sid_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      infra::InviteSessionRow s;
+      s.sid = core::HexEncode(sid_bytes.value());
+      s.invite_id = inv.invite_id;
+      s.created_at = now;
+      s.expires_at = now + 1800;
+
+      auto ins = invite_sessions.Insert(s);
+      if (!ins.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      auto r = RedirectTo("/invite/complete");
+      r.add_header("Set-Cookie", std::string(kInviteCookie) + "=" + s.sid +
+                                "; Path=/; Max-Age=1800; HttpOnly; SameSite=Lax");
+      return r;
+    });
+
+    // ---- invite complete GET/POST ----
+    CROW_ROUTE(app, "/invite/complete").methods("GET"_method)([&](const crow::request& req) {
+      auto is = require_invite_session(req);
+      if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1><p>Please open your invite link again.</p>");
+
+      auto inv = invites.GetById(is->invite_id);
+      if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+      const auto& row = *inv.value();
+      if (row.status == infra::InviteStatus::kRevoked) return HtmlPage(410, "<h1>Invitation revoked</h1>");
+
+      auto prof = invite_profiles.GetByInviteId(row.invite_id);
+      std::string display;
+      if (prof.ok() && prof.value().has_value()) display = prof.value()->display_name;
+
+      std::string html;
+      html += "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+      html += "<title>Complete invitation</title><style>";
+      html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px}";
+      html += "label{display:block;margin-top:14px} input{width:100%;padding:10px;margin-top:6px}";
+      html += "button{margin-top:16px;padding:10px 14px} .card{padding:16px;border:1px solid #ddd;border-radius:12px}";
+      html += ".muted{color:#555} code{background:#f4f4f4;padding:2px 6px;border-radius:6px}";
+      html += "</style></head><body>";
+      html += "<h1>Complete invitation</h1>";
+      html += "<div class=\"card\">";
+      html += "<p class=\"muted\">Tenant: <b>" + crow::json::escape(row.tenant_id) + "</b></p>";
+      html += "<p class=\"muted\">User: <b>" + crow::json::escape(row.invited_uid) + "</b></p>";
+      html += "<p class=\"muted\">Email: <b>" + crow::json::escape(row.invited_email) + "</b></p>";
+      html += "<form method=\"post\" action=\"/invite/complete\">";
+      html += "<label>Display name (optional)<input name=\"display_name\" value=\"" + crow::json::escape(display) + "\"></label>";
+      html += "<button type=\"submit\">Finish</button>";
+      html += "</form>";
+      html += "</div></body></html>";
+      return HtmlPage(200, html);
+    });
+
+    CROW_ROUTE(app, "/invite/complete").methods("POST"_method)([&](const crow::request& req) {
+      auto is = require_invite_session(req);
+      if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      auto inv = invites.GetById(is->invite_id);
+      if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+
+      const auto now = core::UnixNow();
+      const std::optional<std::string> dn = core::FormGet(req.body, "display_name");
+      const std::string display = dn.value_or("");
+
+      infra::InviteProfileRow pr;
+      pr.invite_id = is->invite_id;
+      pr.display_name = display;
+      pr.created_at = now;
+      pr.updated_at = now;
+
+      (void)invite_profiles.Upsert(pr);
+      (void)invites.UpdateStatus(is->invite_id, infra::InviteStatus::kCompleted, now);
+      (void)invite_sessions.Consume(is->sid, now);
+
+      auto r = HtmlPage(200, "<h1>Done</h1><p>Your invitation is completed.</p><p><a href=\"/login\">Login</a></p>");
+      r.add_header("Set-Cookie", std::string(kInviteCookie) + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+      return r;
+    });
+
+    // ---- JSON auth + me ----
     CROW_ROUTE(app, "/api/me").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) {
@@ -332,18 +660,13 @@ core::Result<void> HttpServer::Run() {
       v["uid"] = s->uid;
       v["tenant_id"] = s->tenant_id;
       v["expires_at"] = s->expires_at;
-      v["ticket_id"] = s->ticket_id;
       return Json(200, v);
     });
 
-    // Login (JSON)
     CROW_ROUTE(app, "/api/auth/login").methods("POST"_method)([&](const crow::request& req) {
       auto body = crow::json::load(req.body);
       if (!body) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid json";
-        return Json(400, v);
+        crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json"; return Json(400, v);
       }
 
       LoginRequest lr;
@@ -352,28 +675,19 @@ core::Result<void> HttpServer::Run() {
 
       auto vr = auth.Verify(lr);
       if (!vr.ok() || !vr.value().has_value()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid credentials";
-        return Json(401, v);
+        crow::json::wvalue v; v["ok"]=false; v["error"]="invalid credentials"; return Json(401, v);
       }
-      const LoginPrincipal& principal = *vr.value();
 
+      const LoginPrincipal& principal = *vr.value();
       auto ticket_id = StoreTicketIfPresent(vault, master_key, principal);
       if (!ticket_id.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
+        crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
       }
 
       auto sid_bytes = core::RandomBytes(32);
       auto csrf_bytes = core::RandomBytes(32);
       if (!sid_bytes.ok() || !csrf_bytes.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
+        crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
       }
 
       infra::SessionRow row;
@@ -387,10 +701,7 @@ core::Result<void> HttpServer::Run() {
 
       auto ins = sessions.Insert(row, csrf_bytes.value());
       if (!ins.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
+        crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
       }
 
       crow::json::wvalue v;
@@ -398,7 +709,6 @@ core::Result<void> HttpServer::Run() {
       v["uid"] = row.uid;
       v["tenant_id"] = row.tenant_id;
       v["expires_at"] = row.expires_at;
-      v["ticket_id"] = row.ticket_id;
 
       auto resp = Json(200, v);
       resp.add_header("Set-Cookie",
@@ -408,261 +718,135 @@ core::Result<void> HttpServer::Run() {
       return resp;
     });
 
-    CROW_ROUTE(app, "/api/auth/logout").methods("POST"_method)([&](const crow::request& req) {
-      const std::string sid = CookieValueFromHeader(req, cfg_.session_cookie_name);
-      if (!sid.empty()) (void)sessions.DeleteBySid(sid);
-
-      crow::json::wvalue v;
-      v["ok"] = true;
-
-      auto resp = Json(200, v);
-      resp.add_header("Set-Cookie",
-                      cfg_.session_cookie_name + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
-      return resp;
-    });
-
-    // Connect Desktop:
-    // - creates XRDP OTP (one-time)
-    // - creates Kerberos fetch token (one-time)
-    // Input: { "host_id": "xrdp-u-1234" }
-    // Output: { ok, uid, host_id, otp, otp_expires_at, token, token_expires_at }
-    CROW_ROUTE(app, "/api/portal/connect").methods("POST"_method)([&](const crow::request& req) {
+    // ---- Admin APIs ----
+    CROW_ROUTE(app, "/api/admin/invites/list").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
-      if (!s.has_value()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "unauthenticated";
-        return Json(401, v);
-      }
-      if (s->ticket_id.empty()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "no kerberos ticket in session (need --auth krb5)";
-        return Json(409, v);
-      }
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
-      auto body = crow::json::load(req.body);
-      if (!body || !body.has("host_id")) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid json (need host_id)";
-        return Json(400, v);
-      }
-      const std::string host_id = std::string(body["host_id"].s());
-      if (host_id.empty()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "host_id empty";
-        return Json(400, v);
-      }
+      const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
+      const std::string uid = req.url_params.get("invited_uid") ? req.url_params.get("invited_uid") : "";
 
-      const std::int64_t now = core::UnixNow();
-
-      // XRDP OTP: 16 bytes -> hex, TTL 60s
-      auto otp_bytes = core::RandomBytes(16);
-      auto otp_id_bytes = core::RandomBytes(16);
-      if (!otp_bytes.ok() || !otp_id_bytes.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
-      }
-      const std::string otp_hex = core::HexEncode(otp_bytes.value());
-      const std::string xrdp_otp_id = core::HexEncode(otp_id_bytes.value());
-      const std::int64_t otp_exp = now + 60;
-
-      infra::XrdpOtpRow otp_row;
-      otp_row.xrdp_otp_id = xrdp_otp_id;
-      otp_row.uid = s->uid;
-      otp_row.tenant_id = s->tenant_id;
-      otp_row.host_id = host_id;
-      otp_row.otp_hash = otp_bytes.value();  // NOTE: treat as hash for now
-      otp_row.issued_at = now;
-      otp_row.expires_at = otp_exp;
-      otp_row.max_attempts = 3;
-      otp_row.attempts = 0;
-      otp_row.issued_by_sid = s->sid;
-      otp_row.ticket_id = s->ticket_id;
-
-      auto ins_otp = xrdp_otp_repo.Insert(otp_row);
-      if (!ins_otp.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
-      }
-
-      // Credential fetch token: 32 bytes -> hex, TTL 120s
-      auto tok_bytes = core::RandomBytes(32);
-      auto id_bytes = core::RandomBytes(16);
-      if (!tok_bytes.ok() || !id_bytes.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
-      }
-      const std::string token_hex = core::HexEncode(tok_bytes.value());
-      const std::string cft_id = core::HexEncode(id_bytes.value());
-      const std::int64_t tok_exp = now + 120;
-
-      infra::CredFetchTokenRow trow;
-      trow.cft_id = cft_id;
-      trow.uid = s->uid;
-      trow.tenant_id = s->tenant_id;
-      trow.host_id = host_id;
-      trow.token_hash = tok_bytes.value();  // NOTE: treat as hash for now
-      trow.issued_at = now;
-      trow.expires_at = tok_exp;
-      trow.ticket_id = s->ticket_id;
-
-      auto ins = cft_repo.Insert(trow);
-      if (!ins.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
-      }
+      auto rows = invites.ListLatest(50, tenant, uid);
+      if (!rows.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=rows.status().ToString(); return Json(500, v); }
 
       crow::json::wvalue v;
       v["ok"] = true;
-      v["uid"] = s->uid;
-      v["host_id"] = host_id;
-      v["otp"] = otp_hex;
-      v["otp_expires_at"] = otp_exp;
-      v["token"] = token_hex;
-      v["token_expires_at"] = tok_exp;
+      v["items"] = crow::json::wvalue::list();
+
+      unsigned int idx = 0;
+      for (const auto& r : rows.value()) {
+        crow::json::wvalue it;
+        it["invite_id"] = r.invite_id;
+        it["tenant_id"] = r.tenant_id;
+        it["invited_uid"] = r.invited_uid;
+        it["invited_email"] = r.invited_email;
+        it["status"] = static_cast<int>(r.status);
+        it["status_name"] = InviteStatusName(r.status);
+        it["created_at"] = r.created_at;
+        it["expires_at"] = r.expires_at;
+        it["revoked_at"] = r.revoked_at;
+        it["created_by"] = r.created_by;
+        v["items"][idx++] = std::move(it);
+      }
       return Json(200, v);
     });
 
-    // XRDP OTP verify (internal): PAM helper will call this.
-    // Header: X-Gatehouse-Internal-Secret: <GATEHOUSE_INTERNAL_SECRET>
-    // Input JSON: { "uid":"...", "host_id":"...", "otp":"<hex>" }
-    // Output JSON: { ok:true } or 401/403/400
-    CROW_ROUTE(app, "/xrdp/otp/verify").methods("POST"_method)([&](const crow::request& req) {
-      const std::string hdr = req.get_header_value("X-Gatehouse-Internal-Secret");
-      if (hdr.empty() || !ConstantTimeEq(hdr, internal_secret)) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "forbidden";
-        return Json(403, v);
-      }
+    CROW_ROUTE(app, "/api/admin/invites/revoke").methods("POST"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
       auto body = crow::json::load(req.body);
-      if (!body || !body.has("uid") || !body.has("host_id") || !body.has("otp")) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid json";
-        return Json(400, v);
-      }
+      if (!body || !body.has("invite_id")) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json (need invite_id)"; return Json(400, v); }
+      const std::string invite_id = std::string(body["invite_id"].s());
+      if (invite_id.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="invite_id empty"; return Json(400, v); }
 
-      const std::string uid = std::string(body["uid"].s());
-      const std::string host_id = std::string(body["host_id"].s());
-      const std::string otp_hex = std::string(body["otp"].s());
-
-      auto otp_bytes = core::HexDecode(otp_hex);
-      if (!otp_bytes.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid otp";
-        return Json(400, v);
-      }
-
-      const std::int64_t now = core::UnixNow();
-      auto ok = xrdp_otp_repo.VerifyAndConsume(uid, host_id, otp_bytes.value(), now);
-      if (!ok.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
-      }
-      if (!ok.value()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "unauthorized";
-        return Json(401, v);
-      }
-
-      crow::json::wvalue v;
-      v["ok"] = true;
-      return Json(200, v);
+      auto rc = invites.Revoke(invite_id, core::UnixNow());
+      if (!rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=rc.status().ToString(); return Json(500, v); }
+      crow::json::wvalue v; v["ok"]=true; return Json(200, v);
     });
 
-    // Kerberos ticket fetch (internal) – unchanged
-    CROW_ROUTE(app, "/xrdp/krb/fetch").methods("POST"_method)([&](const crow::request& req) {
-      const std::string hdr = req.get_header_value("X-Gatehouse-Internal-Secret");
-      if (hdr.empty() || !ConstantTimeEq(hdr, internal_secret)) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "forbidden";
-        return Json(403, v);
-      }
+    CROW_ROUTE(app, "/api/admin/invites").methods("POST"_method)([&](const crow::request& req) {
+      try {
+        auto s = require_auth(req);
+        if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+        if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
-      auto body = crow::json::load(req.body);
-      if (!body || !body.has("uid") || !body.has("host_id") || !body.has("token")) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid json";
-        return Json(400, v);
-      }
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("tenant_ou") || !body.has("uid")) {
+          crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json (need tenant_ou, uid)"; return Json(400, v);
+        }
+        const std::string tenant_ou = std::string(body["tenant_ou"].s());
+        const std::string uid = std::string(body["uid"].s());
+        if (tenant_ou.empty() || uid.empty()) {
+          crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_ou/uid empty"; return Json(400, v);
+        }
 
-      const std::string uid = std::string(body["uid"].s());
-      const std::string host_id = std::string(body["host_id"].s());
-      const std::string token_hex = std::string(body["token"].s());
+        std::optional<std::string> mail;
+        if (ldap_dir.has_value()) {
+          auto rc = ldap_dir->LookupMail(tenant_ou, uid);
+          if (!rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=rc.status().ToString(); return Json(502, v); }
+          mail = rc.value();
+        } else if (!cfg_.ldif_path.empty()) {
+          mail = ldif_dir.LookupMail(tenant_ou, uid);
+        } else {
+          crow::json::wvalue v; v["ok"]=false; v["error"]="no directory configured"; return Json(409, v);
+        }
 
-      auto token_bytes = core::HexDecode(token_hex);
-      if (!token_bytes.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "invalid token";
-        return Json(400, v);
-      }
+        if (!mail.has_value() || mail->empty()) {
+          crow::json::wvalue v; v["ok"]=false; v["error"]="user not found or missing mail"; return Json(404, v);
+        }
 
-      const std::int64_t now = core::UnixNow();
-      auto ticket_id = cft_repo.VerifyAndConsume(uid, host_id, token_bytes.value(), now);
-      if (!ticket_id.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "internal error";
-        return Json(500, v);
-      }
-      if (!ticket_id.value().has_value()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "unauthorized";
-        return Json(401, v);
-      }
+        auto token_bytes = core::RandomBytes(32);
+        auto invite_id_bytes = core::RandomBytes(16);
+        if (!token_bytes.ok() || !invite_id_bytes.ok()) {
+          crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
+        }
+        const std::string token_hex = core::HexEncode(token_bytes.value());
 
-      auto tv = vault_read.GetById(*ticket_id.value());
-      if (!tv.ok() || !tv.value().has_value()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "not found";
-        return Json(404, v);
-      }
+        auto token_hash = core::Sha256(token_bytes.value());
+        if (!token_hash.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v); }
 
-      const infra::TicketVaultReadRow& row = *tv.value();
-      if (row.expires_at <= now) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "ticket expired";
-        return Json(401, v);
-      }
+        infra::InviteRow row;
+        row.invite_id = core::HexEncode(invite_id_bytes.value());
+        row.tenant_id = tenant_ou;
+        row.invited_email = *mail;
+        row.invited_uid = uid;
+        row.token_hash = std::move(token_hash.value());
+        row.status = infra::InviteStatus::kInvited;
+        row.created_at = core::UnixNow();
+        row.expires_at = row.created_at + cfg_.invite_ttl_seconds;
+        row.created_by = s->uid;
 
-      const std::string aad_str(row.aad.begin(), row.aad.end());
-      auto pt = core::Aes256GcmDecrypt(master_key, row.nonce, aad_str, row.ccache_blob_enc);
-      if (!pt.ok()) {
-        crow::json::wvalue v;
-        v["ok"] = false;
-        v["error"] = "decrypt failed";
-        return Json(401, v);
-      }
+        auto ins = invites.Insert(row);
+        if (!ins.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=ins.status().ToString(); return Json(500, v); }
 
-      crow::response r;
-      r.code = 200;
-      r.set_header("Content-Type", "application/octet-stream");
-      r.body.assign(reinterpret_cast<const char*>(pt.value().data()),
-                    reinterpret_cast<const char*>(pt.value().data() + pt.value().size()));
-      return r;
+        const std::string invite_url = cfg_.public_base_url + "/invite/accept?token=" + token_hex;
+        const std::string subject = "Gatehouse invitation (" + tenant_ou + ")";
+        const std::string body_txt =
+            "Hello,\n\n"
+            "you have been invited to Gatehouse.\n\n"
+            "Tenant: " + tenant_ou + "\n"
+            "User: " + uid + "\n\n"
+            "Accept invitation:\n" + invite_url + "\n\n";
+
+        auto mail_rc = email->SendText(*mail, subject, body_txt);
+        if (!mail_rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]="mail send failed: " + mail_rc.status().ToString(); return Json(502, v); }
+
+        crow::json::wvalue v;
+        v["ok"] = true;
+        v["tenant_ou"] = tenant_ou;
+        v["uid"] = uid;
+        v["invited_email"] = *mail;
+        v["invite_url"] = invite_url;
+        v["expires_at"] = row.expires_at;
+        return Json(200, v);
+      } catch (const std::exception& e) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]=std::string("exception: ") + e.what(); return Json(500, v);
+      } catch (...) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]="unknown exception"; return Json(500, v);
+      }
     });
 
     app.bindaddr(cfg_.bind_addr)
@@ -672,8 +856,7 @@ core::Result<void> HttpServer::Run() {
 
     return core::Result<void>::Ok();
   } catch (...) {
-    return core::Result<void>::Err(
-        core::Status::Error(core::StatusCode::kInternal, "HTTP server crashed"));
+    return core::Result<void>::Err(core::Status::Error(core::StatusCode::kInternal, "HTTP server crashed"));
   }
 }
 

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "app/http_server.h"
 #include "infra/migrate.h"
@@ -15,7 +16,12 @@ void PrintUsage(const char* argv0) {
       << "Usage: " << argv0
       << " [--bind ADDR] [--port PORT] [--threads N] [--db PATH]\n"
       << "       [--session-ttl SECONDS] [--cookie NAME]\n"
-      << "       [--auth demo|krb5] [--realm REALM] [--allow-demo-fallback]\n";
+      << "       [--auth demo|krb5] [--realm REALM] [--allow-demo-fallback]\n"
+      << "       [--public-base-url URL] [--invite-ttl SECONDS]\n"
+      << "       [--admin-uids CSV] [--email-backend console|curl]\n"
+      << "       [--ldap-url URL] [--ldap-bind-dn DN] [--ldap-bind-pw PW]\n"
+      << "       [--ldap-base-dn DN] [--ldap-starttls]\n"
+      << "       [--ldif PATH]  (fallback)\n";
 }
 
 bool ParseU16(const std::string& s, std::uint16_t* out) {
@@ -40,6 +46,21 @@ bool ParseI64(const std::string& s, std::int64_t* out) {
     *out = static_cast<std::int64_t>(v);
     return true;
   } catch (...) { return false; }
+}
+
+std::vector<std::string> SplitCsv(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ',') {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+      continue;
+    }
+    cur.push_back(c);
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
 }
 
 }  // namespace
@@ -79,6 +100,25 @@ int main(int argc, char** argv) {
     }
     if (arg == "--realm" && i + 1 < argc) { cfg.auth_cfg.krb5_realm = argv[++i]; continue; }
     if (arg == "--allow-demo-fallback") { cfg.auth_cfg.allow_demo_fallback = true; continue; }
+
+    if (arg == "--public-base-url" && i + 1 < argc) { cfg.public_base_url = argv[++i]; continue; }
+    if (arg == "--invite-ttl" && i + 1 < argc) {
+      std::int64_t ttl{};
+      if (!ParseI64(argv[++i], &ttl) || ttl <= 0) { std::cerr << "Invalid --invite-ttl\n"; return 2; }
+      cfg.invite_ttl_seconds = ttl; continue;
+    }
+    if (arg == "--admin-uids" && i + 1 < argc) { cfg.admin_uids = SplitCsv(argv[++i]); continue; }
+    if (arg == "--email-backend" && i + 1 < argc) { cfg.email_backend = argv[++i]; continue; }
+
+    // LDAP
+    if (arg == "--ldap-url" && i + 1 < argc) { cfg.ldap_url = argv[++i]; continue; }
+    if (arg == "--ldap-bind-dn" && i + 1 < argc) { cfg.ldap_bind_dn = argv[++i]; continue; }
+    if (arg == "--ldap-bind-pw" && i + 1 < argc) { cfg.ldap_bind_pw = argv[++i]; continue; }
+    if (arg == "--ldap-base-dn" && i + 1 < argc) { cfg.ldap_base_dn = argv[++i]; continue; }
+    if (arg == "--ldap-starttls") { cfg.ldap_starttls = true; continue; }
+
+    // LDIF fallback
+    if (arg == "--ldif" && i + 1 < argc) { cfg.ldif_path = argv[++i]; continue; }
 
     std::cerr << "Unknown arg: " << arg << "\n";
     PrintUsage(argv[0]);
