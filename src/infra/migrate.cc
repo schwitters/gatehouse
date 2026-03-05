@@ -47,8 +47,8 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
     auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
-    rc = db.SetPragmaUserVersion(1);
-    if (!rc.ok()) return rc;
+    auto u = db.SetPragmaUserVersion(1);
+    if (!u.ok()) return u;
     v = db.GetPragmaUserVersion();
     if (!v.ok()) return core::Result<void>::Err(v.status());
   }
@@ -58,8 +58,8 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
     auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
-    rc = db.SetPragmaUserVersion(2);
-    if (!rc.ok()) return rc;
+    auto u = db.SetPragmaUserVersion(2);
+    if (!u.ok()) return u;
     v = db.GetPragmaUserVersion();
     if (!v.ok()) return core::Result<void>::Err(v.status());
   }
@@ -69,8 +69,8 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
     auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
-    rc = db.SetPragmaUserVersion(3);
-    if (!rc.ok()) return rc;
+    auto u = db.SetPragmaUserVersion(3);
+    if (!u.ok()) return u;
     v = db.GetPragmaUserVersion();
     if (!v.ok()) return core::Result<void>::Err(v.status());
   }
@@ -80,8 +80,19 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
     auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
-    rc = db.SetPragmaUserVersion(4);
+    auto u = db.SetPragmaUserVersion(4);
+    if (!u.ok()) return u;
+    v = db.GetPragmaUserVersion();
+    if (!v.ok()) return core::Result<void>::Err(v.status());
+  }
+
+  if (v.value() == 4) {
+    auto sql = ReadFileToString(cfg.schema_v5_path);
+    if (!sql.ok()) return core::Result<void>::Err(sql.status());
+    auto rc = ExecTx(db, sql.value());
     if (!rc.ok()) return rc;
+    auto u = db.SetPragmaUserVersion(5);
+    if (!u.ok()) return u;
   }
 
   return core::Result<void>::Ok();

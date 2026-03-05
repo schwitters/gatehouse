@@ -21,6 +21,7 @@
 #include "crow/json.h"
 #include "infra/invite_repo.h"
 #include "infra/invite_session_repo.h"
+#include "infra/invite_otp_repo.h"
 #include "infra/ldap_directory.h"
 #include "infra/ldif_directory.h"
 #include "infra/session_repo.h"
@@ -407,6 +408,7 @@ core::Result<void> HttpServer::Run() {
     infra::InviteRepo invites(*db_);
     infra::InviteSessionRepo invite_sessions(*db_);
     infra::InviteProfileRepo invite_profiles(*db_);
+    infra::InviteOtpRepo invite_otps(*db_);
 
     auto gc_sessions = [&] {
       (void)sessions.DeleteExpired(core::UnixNow());
@@ -586,6 +588,8 @@ core::Result<void> HttpServer::Run() {
     });
 
     // ---- invite complete GET/POST ----
+
+    // ---- invite complete GET (with email OTP step-up) ----
     CROW_ROUTE(app, "/invite/complete").methods("GET"_method)([&](const crow::request& req) {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1><p>Please open your invite link again.</p>");
@@ -599,23 +603,45 @@ core::Result<void> HttpServer::Run() {
       std::string display;
       if (prof.ok() && prof.value().has_value()) display = prof.value()->display_name;
 
+      const bool verified = invite_otps.IsVerified(is->sid).ok() ? invite_otps.IsVerified(is->sid).value() : false;
+
+      const std::string sent = req.url_params.get("sent") ? req.url_params.get("sent") : "";
+      const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
+      const std::string ok = req.url_params.get("ok") ? req.url_params.get("ok") : "";
+
+      std::string msg;
+      if (!err.empty()) msg = "<p style='color:#b00020'>Error: " + crow::json::escape(err) + "</p>";
+      else if (!ok.empty()) msg = "<p style='color:#0a7a2f'>Verified.</p>";
+      else if (!sent.empty()) msg = "<p style='color:#555'>Code sent. Check your email.</p>";
+
       std::string html;
-      html += "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+      html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
       html += "<title>Complete invitation</title><style>";
       html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px}";
       html += "label{display:block;margin-top:14px} input{width:100%;padding:10px;margin-top:6px}";
-      html += "button{margin-top:16px;padding:10px 14px} .card{padding:16px;border:1px solid #ddd;border-radius:12px}";
+      html += "button{margin-top:12px;padding:10px 14px} .card{padding:16px;border:1px solid #ddd;border-radius:12px}";
       html += ".muted{color:#555} code{background:#f4f4f4;padding:2px 6px;border-radius:6px}";
       html += "</style></head><body>";
       html += "<h1>Complete invitation</h1>";
-      html += "<div class=\"card\">";
-      html += "<p class=\"muted\">Tenant: <b>" + crow::json::escape(row.tenant_id) + "</b></p>";
-      html += "<p class=\"muted\">User: <b>" + crow::json::escape(row.invited_uid) + "</b></p>";
-      html += "<p class=\"muted\">Email: <b>" + crow::json::escape(row.invited_email) + "</b></p>";
-      html += "<form method=\"post\" action=\"/invite/complete\">";
-      html += "<label>Display name (optional)<input name=\"display_name\" value=\"" + crow::json::escape(display) + "\"></label>";
-      html += "<button type=\"submit\">Finish</button>";
-      html += "</form>";
+      html += "<div class='card'>";
+      html += "<p class='muted'>Tenant: <b>" + crow::json::escape(row.tenant_id) + "</b></p>";
+      html += "<p class='muted'>User: <b>" + crow::json::escape(row.invited_uid) + "</b></p>";
+      html += "<p class='muted'>Email: <b>" + crow::json::escape(row.invited_email) + "</b></p>";
+      html += msg;
+
+      if (!verified) {
+        html += "<h3>Verify email</h3>";
+        html += "<form method='post' action='/invite/otp/send'><button type='submit'>Send code</button></form>";
+        html += "<form method='post' action='/invite/otp/verify'>";
+        html += "<label>Code<input name='code' placeholder='123456' autocomplete='one-time-code'></label>";
+        html += "<button type='submit'>Verify</button></form>";
+      } else {
+        html += "<h3>Profile</h3>";
+        html += "<form method='post' action='/invite/complete'>";
+        html += "<label>Display name (optional)<input name='display_name' value='" + crow::json::escape(display) + "'></label>";
+        html += "<button type='submit'>Finish</button></form>";
+      }
+
       html += "</div></body></html>";
       return HtmlPage(200, html);
     });
@@ -646,7 +672,82 @@ core::Result<void> HttpServer::Run() {
       return r;
     });
 
-    // ---- JSON auth + me ----
+    
+    // ---- invite OTP step-up (email) ----
+    CROW_ROUTE(app, "/invite/otp/send").methods("POST"_method)([&](const crow::request& req) {
+      auto is = require_invite_session(req);
+      if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      auto inv = invites.GetById(is->invite_id);
+      if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+      const auto& row = *inv.value();
+
+      // Create 6-digit OTP.
+      auto rnd = core::RandomBytes(4);
+      if (!rnd.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      const unsigned int v = (static_cast<unsigned int>(rnd.value()[0]) << 24) |
+                             (static_cast<unsigned int>(rnd.value()[1]) << 16) |
+                             (static_cast<unsigned int>(rnd.value()[2]) << 8) |
+                             (static_cast<unsigned int>(rnd.value()[3]) << 0);
+      const unsigned int code = (v % 900000U) + 100000U;
+      const std::string otp = std::to_string(code);
+
+      // Hash OTP.
+      std::vector<std::uint8_t> otp_bytes(otp.begin(), otp.end());
+      auto h = core::Sha256(otp_bytes);
+      if (!h.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      // Replace older OTPs for this sid.
+      (void)invite_otps.DeleteBySid(is->sid);
+
+      auto otp_id_bytes = core::RandomBytes(16);
+      if (!otp_id_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      const std::int64_t now = core::UnixNow();
+      infra::InviteOtpRow o;
+      o.otp_id = core::HexEncode(otp_id_bytes.value());
+      o.sid = is->sid;
+      o.otp_hash = std::move(h.value());
+      o.issued_at = now;
+      o.expires_at = now + 600;  // 10 min
+      o.attempts = 0;
+      o.max_attempts = 5;
+
+      auto ins = invite_otps.Insert(o);
+      if (!ins.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      const std::string subject = "Gatehouse verification code";
+      const std::string body_txt =
+          "Your Gatehouse verification code is:\n\n" + otp + "\n\n"
+          "It expires in 10 minutes.\n";
+
+      auto mail_rc = email->SendText(row.invited_email, subject, body_txt);
+      if (!mail_rc.ok()) return HtmlPage(502, "<h1>Mail send failed</h1>");
+
+      return RedirectTo("/invite/complete?sent=1");
+    });
+
+    CROW_ROUTE(app, "/invite/otp/verify").methods("POST"_method)([&](const crow::request& req) {
+      auto is = require_invite_session(req);
+      if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      const std::optional<std::string> c = core::FormGet(req.body, "code");
+      const std::string code = c.value_or("");
+      if (code.size() < 4 || code.size() > 10) return RedirectTo("/invite/complete?err=invalid+code");
+
+      std::vector<std::uint8_t> otp_bytes(code.begin(), code.end());
+      auto h = core::Sha256(otp_bytes);
+      if (!h.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
+      const std::int64_t now = core::UnixNow();
+      auto ok = invite_otps.VerifyAndConsume(is->sid, h.value(), now);
+      if (!ok.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (!ok.value()) return RedirectTo("/invite/complete?err=wrong+code");
+
+      return RedirectTo("/invite/complete?ok=1");
+    });
+
+// ---- JSON auth + me ----
     CROW_ROUTE(app, "/api/me").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) {

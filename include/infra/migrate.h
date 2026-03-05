@@ -12,13 +12,11 @@ struct MigrateConfig {
   std::string schema_v2_path{"db/schema_v2.sql"};
   std::string schema_v3_path{"db/schema_v3.sql"};
   std::string schema_v4_path{"db/schema_v4.sql"};
+  std::string schema_v5_path{"db/schema_v5.sql"};
 };
 
-// Applies schema incrementally:
-// - if user_version == 0: apply v1 -> user_version=1
-// - if user_version == 1: apply v2 -> user_version=2
-// - if user_version == 2: apply v3 -> user_version=3
-// - if user_version == 3: apply v4 -> user_version=4
+// Applies schema incrementally up to current.
+// user_version: 0->1->2->3->4->5
 [[nodiscard]] core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg);
 
 }  // namespace gatehouse::infra

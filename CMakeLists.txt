@@ -87,6 +87,7 @@ add_executable(gatehouse
   src/app/email_sender.cc
   src/infra/invite_repo.cc
   src/infra/invite_session_repo.cc
+  src/infra/invite_otp_repo.cc
   src/infra/ldif_directory.cc
   src/core/sha256.cc
 
