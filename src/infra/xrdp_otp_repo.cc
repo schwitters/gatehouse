@@ -72,12 +72,12 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   auto tx = db_.Exec("BEGIN IMMEDIATE;");
   if (!tx.ok()) return core::Result<bool>::Err(tx.status());
 
-  // 1) Find matching, unconsumed, unexpired OTP, attempts < max_attempts
   sqlite3_stmt* sel = nullptr;
+  // Auch hier: Kein Filter mehr nach otp_hash
   const char* sel_sql =
-      "SELECT xrdp_otp_id, attempts, max_attempts FROM xrdp_otp "
-      "WHERE uid=? AND host_id=? AND otp_hash=? AND consumed_at IS NULL AND expires_at>? "
-      "LIMIT 1;";
+      "SELECT xrdp_otp_id, attempts, max_attempts, expires_at, otp_hash FROM xrdp_otp "
+      "WHERE uid=? AND host_id=? AND consumed_at IS NULL "
+      "ORDER BY issued_at DESC LIMIT 1;";
   int rc = sqlite3_prepare_v2(dbh, sel_sql, -1, &sel, nullptr);
   if (rc != SQLITE_OK) {
     (void)db_.Exec("ROLLBACK;");
@@ -86,9 +86,6 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
 
   (void)sqlite3_bind_text(sel, 1, uid.c_str(), -1, SQLITE_TRANSIENT);
   (void)sqlite3_bind_text(sel, 2, host_id.c_str(), -1, SQLITE_TRANSIENT);
-  (void)sqlite3_bind_blob(sel, 3, otp_hash.data(),
-                          static_cast<int>(otp_hash.size()), SQLITE_TRANSIENT);
-  (void)sqlite3_bind_int64(sel, 4, now);
 
   rc = sqlite3_step(sel);
   if (rc != SQLITE_ROW) {
@@ -101,25 +98,37 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   const std::string otp_id = reinterpret_cast<const char*>(sqlite3_column_text(sel, 0));
   const int attempts = sqlite3_column_int(sel, 1);
   const int max_attempts = sqlite3_column_int(sel, 2);
+  const std::int64_t expires_at = sqlite3_column_int64(sel, 3);
+  
+  const void* blob_ptr = sqlite3_column_blob(sel, 4);
+  const int blob_bytes = sqlite3_column_bytes(sel, 4);
+  std::vector<std::uint8_t> db_hash;
+  if (blob_ptr && blob_bytes > 0) {
+    const auto* b = static_cast<const std::uint8_t*>(blob_ptr);
+    db_hash.assign(b, b + blob_bytes);
+  }
   sqlite3_finalize(sel);
 
-  if (attempts >= max_attempts) {
+  if (expires_at <= now || attempts >= max_attempts) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Ok(false);
   }
 
-  // 2) Consume it (and increment attempts just for tracking).
+  const bool matched = (db_hash == otp_hash);
+
   sqlite3_stmt* upd = nullptr;
   const char* upd_sql =
-      "UPDATE xrdp_otp SET consumed_at=?, attempts=attempts+1 "
-      "WHERE xrdp_otp_id=? AND consumed_at IS NULL;";
+      "UPDATE xrdp_otp SET attempts = attempts + 1, "
+      "consumed_at = CASE WHEN ? THEN ? ELSE consumed_at END "
+      "WHERE xrdp_otp_id = ?;";
   rc = sqlite3_prepare_v2(dbh, upd_sql, -1, &upd, nullptr);
   if (rc != SQLITE_OK) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "prepare(update)"));
   }
-  (void)sqlite3_bind_int64(upd, 1, now);
-  (void)sqlite3_bind_text(upd, 2, otp_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_int(upd, 1, matched ? 1 : 0);
+  (void)sqlite3_bind_int64(upd, 2, now);
+  (void)sqlite3_bind_text(upd, 3, otp_id.c_str(), -1, SQLITE_TRANSIENT);
 
   rc = sqlite3_step(upd);
   sqlite3_finalize(upd);
@@ -131,7 +140,7 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   auto cm = db_.Exec("COMMIT;");
   if (!cm.ok()) return core::Result<bool>::Err(cm.status());
 
-  return core::Result<bool>::Ok(true);
+  return core::Result<bool>::Ok(matched);
 }
 
 }  // namespace gatehouse::infra

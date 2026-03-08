@@ -90,9 +90,10 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   if (!tx.ok()) return core::Result<bool>::Err(tx.status());
 
   sqlite3_stmt* sel = nullptr;
+  // Wir filtern NICHT mehr nach otp_hash, um falsche Eingaben mitzählen zu können.
   const char* sel_sql =
-      "SELECT otp_id, attempts, max_attempts FROM invite_otp "
-      "WHERE sid=? AND otp_hash=? AND consumed_at IS NULL AND expires_at>? "
+      "SELECT otp_id, attempts, max_attempts, expires_at, otp_hash FROM invite_otp "
+      "WHERE sid=? AND consumed_at IS NULL "
       "ORDER BY issued_at DESC LIMIT 1;";
   int rc = sqlite3_prepare_v2(dbh, sel_sql, -1, &sel, nullptr);
   if (rc != SQLITE_OK) {
@@ -101,8 +102,6 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   }
 
   (void)sqlite3_bind_text(sel, 1, sid.c_str(), -1, SQLITE_TRANSIENT);
-  (void)sqlite3_bind_blob(sel, 2, otp_hash.data(), static_cast<int>(otp_hash.size()), SQLITE_TRANSIENT);
-  (void)sqlite3_bind_int64(sel, 3, now);
 
   rc = sqlite3_step(sel);
   if (rc != SQLITE_ROW) {
@@ -115,25 +114,41 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   const std::string otp_id = reinterpret_cast<const char*>(sqlite3_column_text(sel, 0));
   const int attempts = sqlite3_column_int(sel, 1);
   const int max_attempts = sqlite3_column_int(sel, 2);
+  const std::int64_t expires_at = sqlite3_column_int64(sel, 3);
+  
+  const void* blob_ptr = sqlite3_column_blob(sel, 4);
+  const int blob_bytes = sqlite3_column_bytes(sel, 4);
+  std::vector<std::uint8_t> db_hash;
+  if (blob_ptr && blob_bytes > 0) {
+    const auto* b = static_cast<const std::uint8_t*>(blob_ptr);
+    db_hash.assign(b, b + blob_bytes);
+  }
   sqlite3_finalize(sel);
 
-  if (attempts >= max_attempts) {
+  // Abbruch, wenn bereits abgelaufen oder zu viele Versuche.
+  if (expires_at <= now || attempts >= max_attempts) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Ok(false);
   }
 
+  // Hash-Vergleich in C++
+  const bool matched = (db_hash == otp_hash);
+
   sqlite3_stmt* upd = nullptr;
   const char* upd_sql =
-      "UPDATE invite_otp SET consumed_at=?, attempts=attempts+1 "
-      "WHERE otp_id=? AND consumed_at IS NULL;";
+      "UPDATE invite_otp SET attempts = attempts + 1, "
+      "consumed_at = CASE WHEN ? THEN ? ELSE consumed_at END "
+      "WHERE otp_id = ?;";
   rc = sqlite3_prepare_v2(dbh, upd_sql, -1, &upd, nullptr);
   if (rc != SQLITE_OK) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "prepare(update invite_otp)"));
   }
 
-  (void)sqlite3_bind_int64(upd, 1, now);
-  (void)sqlite3_bind_text(upd, 2, otp_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_int(upd, 1, matched ? 1 : 0);
+  (void)sqlite3_bind_int64(upd, 2, now);
+  (void)sqlite3_bind_text(upd, 3, otp_id.c_str(), -1, SQLITE_TRANSIENT);
+
   rc = sqlite3_step(upd);
   sqlite3_finalize(upd);
 
@@ -145,7 +160,32 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   auto cm = db_.Exec("COMMIT;");
   if (!cm.ok()) return core::Result<bool>::Err(cm.status());
 
-  return core::Result<bool>::Ok(true);
+  return core::Result<bool>::Ok(matched);
+}
+
+
+core::Result<std::optional<std::int64_t>> InviteOtpRepo::GetLastIssuedAt(const std::string& sid) {
+  sqlite3* dbh = db_.handle();
+  if (!dbh) return core::Result<std::optional<std::int64_t>>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql = "SELECT issued_at FROM invite_otp WHERE sid=? ORDER BY issued_at DESC LIMIT 1;";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<std::optional<std::int64_t>>::Err(StmtErr(rc, dbh, "prepare(get_last_issued)"));
+
+  (void)sqlite3_bind_text(stmt, 1, sid.c_str(), -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(stmt);
+  
+  std::optional<std::int64_t> res;
+  if (rc == SQLITE_ROW) {
+    res = sqlite3_column_int64(stmt, 0);
+  } else if (rc != SQLITE_DONE) {
+    sqlite3_finalize(stmt);
+    return core::Result<std::optional<std::int64_t>>::Err(StmtErr(rc, dbh, "step(get_last_issued)"));
+  }
+  
+  sqlite3_finalize(stmt);
+  return core::Result<std::optional<std::int64_t>>::Ok(res);
 }
 
 }  // namespace gatehouse::infra

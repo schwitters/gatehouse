@@ -26,7 +26,11 @@ class Krb5Client final {
   [[nodiscard]] core::Result<Krb5VerifyResult> VerifyPasswordAndGetCcache(
       const std::string& username, const std::string& password) const;
 
+  // Changes the password via kadmin/changepw
+  [[nodiscard]] core::Result<void> ChangePassword(const std::string& username, const std::string& old_password, const std::string& new_password) const;
+
  private:
+
   [[nodiscard]] std::string MakePrincipal(const std::string& username) const;
 
   Krb5Config cfg_;

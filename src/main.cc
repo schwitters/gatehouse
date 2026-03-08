@@ -18,7 +18,7 @@ void PrintUsage(const char* argv0) {
       << "       [--session-ttl SECONDS] [--cookie NAME]\n"
       << "       [--auth demo|krb5] [--realm REALM] [--allow-demo-fallback]\n"
       << "       [--public-base-url URL] [--invite-ttl SECONDS]\n"
-      << "       [--admin-uids CSV] [--email-backend console|curl]\n"
+      << "       [--admin-uids CSV] [--ldap-admin-group DN] [--email-backend console|curl]\n"
       << "       [--ldap-url URL] [--ldap-bind-dn DN] [--ldap-bind-pw PW]\n"
       << "       [--ldap-base-dn DN] [--ldap-starttls]\n"
       << "       [--ldif PATH]  (fallback)\n";
@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
       cfg.invite_ttl_seconds = ttl; continue;
     }
     if (arg == "--admin-uids" && i + 1 < argc) { cfg.admin_uids = SplitCsv(argv[++i]); continue; }
+    if (arg == "--ldap-admin-group" && i + 1 < argc) { cfg.ldap_admin_group = argv[++i]; continue; }
     if (arg == "--email-backend" && i + 1 < argc) { cfg.email_backend = argv[++i]; continue; }
 
     // LDAP

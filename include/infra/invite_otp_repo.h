@@ -36,6 +36,8 @@ class InviteOtpRepo final {
   [[nodiscard]] core::Result<void> DeleteBySid(const std::string& sid);
 
   // Checks if there is a consumed OTP for sid (i.e., step-up verified)
+  [[nodiscard]] core::Result<std::optional<std::int64_t>> GetLastIssuedAt(const std::string& sid);
+
   [[nodiscard]] core::Result<bool> IsVerified(const std::string& sid);
 
  private:

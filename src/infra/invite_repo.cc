@@ -232,4 +232,93 @@ core::Result<std::vector<InviteRow>> InviteRepo::ListLatest(std::int32_t limit,
   return core::Result<std::vector<InviteRow>>::Ok(std::move(out));
 }
 
+
+core::Result<std::vector<std::string>> InviteRepo::GetInvitedUids(const std::string& tenant_id,
+                                                                     std::int64_t now) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<std::vector<std::string>>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  // A user counts as "already invited" if they have a completed invite (status=4)
+  // or a non-revoked invite that has not yet expired.
+  const char* sql =
+      "SELECT DISTINCT invited_uid FROM invite "
+      "WHERE tenant_id=? AND invited_uid IS NOT NULL AND status != 6 "
+      "AND (status = 4 OR expires_at > ?);";
+  sqlite3_stmt* stmt = nullptr;
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<std::vector<std::string>>::Err(StmtErr(rc, dbh, "prepare(get_invited_uids)"));
+
+  (void)sqlite3_bind_text(stmt, 1, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_int64(stmt, 2, now);
+
+  std::vector<std::string> out;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    out.push_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+  }
+  sqlite3_finalize(stmt);
+
+  if (rc != SQLITE_DONE) return core::Result<std::vector<std::string>>::Err(StmtErr(rc, dbh, "step(get_invited_uids)"));
+  return core::Result<std::vector<std::string>>::Ok(std::move(out));
+}
+
+core::Result<void> InviteRepo::RevokePending(const std::string& tenant_id,
+                                             const std::string& uid,
+                                             std::int64_t now) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql =
+      "UPDATE invite SET status=6, revoked_at=? "
+      "WHERE tenant_id=? AND invited_uid=? AND status NOT IN (4, 6);";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<void>::Err(StmtErr(rc, dbh, "prepare(revoke_pending)"));
+
+  (void)sqlite3_bind_int64(stmt, 1, now);
+  (void)sqlite3_bind_text(stmt, 2, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_text(stmt, 3, uid.c_str(), -1, SQLITE_TRANSIENT);
+
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(rc, dbh, "step(revoke_pending)"));
+  return core::Result<void>::Ok();
+}
+
+
+core::Result<std::vector<InviteRow>> InviteRepo::GetLatestPerUid(const std::string& tenant_id) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<std::vector<InviteRow>>::Err(
+      core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  // For each uid in the tenant, return the most recently created invite.
+  const char* sql =
+      "SELECT i.invite_id,i.tenant_id,i.invited_email,COALESCE(i.invited_uid,''),"
+      "i.token_hash,i.status,i.created_at,i.expires_at,"
+      "i.consumed_at,i.revoked_at,COALESCE(i.created_by,'') "
+      "FROM invite i "
+      "INNER JOIN ("
+      "  SELECT invited_uid, MAX(created_at) AS max_at "
+      "  FROM invite WHERE tenant_id=? AND invited_uid IS NOT NULL "
+      "  GROUP BY invited_uid"
+      ") latest ON i.invited_uid = latest.invited_uid AND i.created_at = latest.max_at "
+      "WHERE i.tenant_id=?;";
+
+  sqlite3_stmt* stmt = nullptr;
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<std::vector<InviteRow>>::Err(
+      StmtErr(rc, dbh, "prepare(get_latest_per_uid)"));
+
+  (void)sqlite3_bind_text(stmt, 1, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_text(stmt, 2, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+
+  std::vector<InviteRow> out;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    out.push_back(ReadInvite(stmt));
+  }
+  sqlite3_finalize(stmt);
+
+  if (rc != SQLITE_DONE) return core::Result<std::vector<InviteRow>>::Err(
+      StmtErr(rc, dbh, "step(get_latest_per_uid)"));
+  return core::Result<std::vector<InviteRow>>::Ok(std::move(out));
+}
 }  // namespace gatehouse::infra

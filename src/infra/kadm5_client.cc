@@ -1,21 +1,40 @@
 #include "infra/kadm5_client.h"
 
-#include <krb5.h>
 #include <kadm5/admin.h>
 #include <kdb.h>
+#include <krb5.h>
 
 #include <cstring>
+#include <string>
 #include <vector>
+
+#include "krb5_helpers.h"
 
 namespace gatehouse::infra {
 namespace {
 
-core::Status KErr(krb5_context ctx, int code, const char* what) {
-  const char* msg = (ctx ? krb5_get_error_message(ctx, code) : nullptr);
-  std::string s = std::string(what) + " (code=" + std::to_string(code) + "): " + (msg ? msg : "");
-  if (ctx && msg) krb5_free_error_message(ctx, msg);
-  return core::Status::Error(core::StatusCode::kInternal, std::move(s));
-}
+class ScopedKadm5Handle {
+ public:
+  ScopedKadm5Handle() = default;
+
+  ~ScopedKadm5Handle() {
+    if (handle_ != nullptr) {
+      (void)kadm5_destroy(handle_);
+    }
+  }
+
+  ScopedKadm5Handle(const ScopedKadm5Handle&) = delete;
+  ScopedKadm5Handle& operator=(const ScopedKadm5Handle&) = delete;
+
+  ScopedKadm5Handle(ScopedKadm5Handle&&) = delete;
+  ScopedKadm5Handle& operator=(ScopedKadm5Handle&&) = delete;
+
+  void** out() noexcept { return &handle_; }
+  void* get() const noexcept { return handle_; }
+
+ private:
+  void* handle_ = nullptr;
+};
 
 }  // namespace
 
@@ -25,20 +44,33 @@ core::Result<void> Kadm5Client::CreatePrincipal(
     const std::string& new_principal,
     const std::string& new_password,
     const std::string& ldap_dn) const {
-  
   if (cfg_.realm.empty()) {
-    return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "Kadm5 config incomplete: 'realm' is empty (did you pass --realm CATUNO.LAB?)"));
+    return core::Result<void>::Err(
+        core::Status::Error(
+            core::StatusCode::kFailedPrecondition,
+            "Kadm5 config incomplete: 'realm' is empty "
+            "(did you pass --realm <REALM>?)"));
   }
   if (cfg_.admin_principal.empty()) {
-    return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "Kadm5 config incomplete: 'admin_principal' is empty (GATEHOUSE_KADM5_ADMIN_PRINC missing)"));
+    return core::Result<void>::Err(
+        core::Status::Error(
+            core::StatusCode::kFailedPrecondition,
+            "Kadm5 config incomplete: 'admin_principal' is empty "
+            "(GATEHOUSE_KADM5_ADMIN_PRINC missing)"));
   }
   if (cfg_.admin_password.empty()) {
-    return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "Kadm5 config incomplete: 'admin_password' is empty (GATEHOUSE_KADM5_ADMIN_PASS missing)"));
+    return core::Result<void>::Err(
+        core::Status::Error(
+            core::StatusCode::kFailedPrecondition,
+            "Kadm5 config incomplete: 'admin_password' is empty "
+            "(GATEHOUSE_KADM5_ADMIN_PASS missing)"));
   }
 
-  krb5_context ctx = nullptr;
-  krb5_error_code kret = krb5_init_context(&ctx);
-  if (kret) return core::Result<void>::Err(KErr(ctx, kret, "krb5_init_context"));
+  auto ctx_result = MakeKrb5Context();
+  if (!ctx_result.ok()) {
+    return core::Result<void>::Err(ctx_result.status());
+  }
+  auto ctx = std::move(ctx_result.value());
 
   kadm5_config_params params;
   std::memset(&params, 0, sizeof(params));
@@ -50,11 +82,11 @@ core::Result<void> Kadm5Client::CreatePrincipal(
     params.admin_server = const_cast<char*>(cfg_.admin_server.c_str());
   }
 
-  void* handle = nullptr;
-  char* db_args[] = { nullptr };
+  ScopedKadm5Handle handle;
+  char* db_args[] = {nullptr};
 
-  kadm5_ret_t ret = kadm5_init_with_password(
-      ctx,
+  const kadm5_ret_t init_ret = kadm5_init_with_password(
+      ctx.get(),
       const_cast<char*>(cfg_.admin_principal.c_str()),
       const_cast<char*>(cfg_.admin_password.c_str()),
       const_cast<char*>("kadmin/admin"),
@@ -62,26 +94,21 @@ core::Result<void> Kadm5Client::CreatePrincipal(
       KADM5_STRUCT_VERSION,
       KADM5_API_VERSION_4,
       db_args,
-      &handle
-  );
-  if (ret) {
-    auto err = KErr(ctx, ret, "kadm5_init_with_password");
-    krb5_free_context(ctx);
-    return core::Result<void>::Err(err);
+      handle.out());
+  if (init_ret != 0) {
+    return core::Result<void>::Err(
+        Kadm5ErrorStatus("kadm5_init_with_password", ctx.get(),init_ret));
   }
 
-  krb5_principal newprinc = nullptr;
-  kret = krb5_parse_name(ctx, new_principal.c_str(), &newprinc);
-  if (kret) {
-    kadm5_destroy(handle);
-    auto err = KErr(ctx, kret, "krb5_parse_name");
-    krb5_free_context(ctx);
-    return core::Result<void>::Err(err);
+  auto principal_result = ParseKrb5Principal(ctx.get(), new_principal);
+  if (!principal_result.ok()) {
+    return core::Result<void>::Err(principal_result.status());
   }
+  auto principal = std::move(principal_result.value());
 
   kadm5_principal_ent_rec ent;
   std::memset(&ent, 0, sizeof(ent));
-  ent.principal = newprinc;
+  ent.principal = principal.get();
 
   long mask = KADM5_PRINCIPAL;
 
@@ -95,7 +122,7 @@ core::Result<void> Kadm5Client::CreatePrincipal(
     tl_contents.push_back('\0');
 
     tl.tl_data_type = KRB5_TL_DB_ARGS;
-    tl.tl_data_length = static_cast<unsigned int>(tl_contents.size());
+    tl.tl_data_length = static_cast<short unsigned int> (tl_contents.size());
     tl.tl_data_contents = reinterpret_cast<krb5_octet*>(tl_contents.data());
     tl.tl_data_next = nullptr;
 
@@ -104,16 +131,15 @@ core::Result<void> Kadm5Client::CreatePrincipal(
     mask |= KADM5_TL_DATA;
   }
 
-  ret = kadm5_create_principal(handle, &ent, mask, const_cast<char*>(new_password.c_str()));
-  
-  kadm5_destroy(handle);
-  krb5_free_principal(ctx, newprinc);
-  krb5_free_context(ctx);
+  const kadm5_ret_t create_ret = kadm5_create_principal(
+      handle.get(),
+      &ent,
+      mask,
+      const_cast<char*>(new_password.c_str()));
 
-  if (ret) {
-    // Falls der Principal schon existiert, ist das oft kein harter Fehler im Flow, wir könnten ein Password-Update machen.
-    // Aber wir geben es hier als sauberen Fehler zurück.
-    return core::Result<void>::Err(core::Status::Error(core::StatusCode::kInternal, "kadm5_create_principal failed: code " + std::to_string(ret)));
+  if (create_ret != 0) {
+    return core::Result<void>::Err(
+        Kadm5ErrorStatus("kadm5_create_principal",ctx.get(), create_ret));
   }
 
   return core::Result<void>::Ok();

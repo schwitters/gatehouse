@@ -52,10 +52,23 @@ class InviteRepo final {
 
   [[nodiscard]] core::Result<void> Revoke(const std::string& invite_id, std::int64_t now);
 
-  // List newest invites, optionally filtered by tenant_id and/or invited_uid.
+  // Revoke all non-completed, non-revoked invites for tenant+uid (used before re-invite).
+  [[nodiscard]] core::Result<void> RevokePending(const std::string& tenant_id,
+                                                 const std::string& uid,
+                                                 std::int64_t now);
+
+  // Returns UIDs that have an active (non-expired, non-revoked) or completed invite.
+  [[nodiscard]] core::Result<std::vector<std::string>> GetInvitedUids(const std::string& tenant_id,
+                                                                       std::int64_t now);
+
   [[nodiscard]] core::Result<std::vector<InviteRow>> ListLatest(std::int32_t limit,
                                                                 const std::string& tenant_id,
                                                                 const std::string& invited_uid);
+
+  // Returns the most recent invite per uid for the given tenant.
+  // Result is one InviteRow per uid (the latest by created_at).
+  [[nodiscard]] core::Result<std::vector<InviteRow>> GetLatestPerUid(
+      const std::string& tenant_id);
 
  private:
   SqliteDb& db_;

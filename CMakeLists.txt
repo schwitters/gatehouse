@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(gatehouse LANGUAGES CXX)
-
+set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -71,6 +71,8 @@ FetchContent_MakeAvailable(crow)
 find_package(SQLite3 REQUIRED)
 
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(COM_ERR REQUIRED com_err)
+pkg_check_modules(KADM5 REQUIRED kadm-client)
 pkg_check_modules(KRB5 REQUIRED krb5)
 pkg_check_modules(LDAP REQUIRED ldap)
 
@@ -100,6 +102,7 @@ add_executable(gatehouse
   src/infra/migrate.cc
   src/infra/session_repo.cc
   src/infra/krb5_client.cc
+  src/infra/kadm5_client.cc
   src/infra/ldap_directory.cc
   src/infra/ticket_vault_read.cc
   src/infra/xrdp_otp_repo.cc
@@ -134,11 +137,18 @@ get_target_property(_sqlite_inc SQLite::SQLite3 INTERFACE_INCLUDE_DIRECTORIES)
 if (_sqlite_inc)
   target_include_directories(gatehouse SYSTEM PRIVATE ${_sqlite_inc})
 endif()
+message(STATUS    "Libraries:  ${COM_ERR_LIBRARIES}")
+message(STATUS    "Includes:   ${COM_ERR_INCLUDE_DIRS}")
 
 # MIT Kerberos (pkg-config)
-target_include_directories(gatehouse SYSTEM PRIVATE ${KRB5_INCLUDE_DIRS})
-target_link_directories(gatehouse PRIVATE ${KRB5_LIBRARY_DIRS})
-target_link_libraries(gatehouse PRIVATE ${KRB5_LIBRARIES})
+target_include_directories(gatehouse SYSTEM PRIVATE ${KRB5_INCLUDE_DIRS} ${KADM5_INCLUDE_DIRS} ${COM_ERR_INCLUDE_DIRS})
+target_link_directories(gatehouse PRIVATE ${KRB5_LIBRARY_DIRS} ${KADM5_LIBRARY_DIRS})
+target_link_libraries(gatehouse PRIVATE 
+   ${KRB5_LIBRARIES} 
+   ${KADM5_LIBRARIES} 
+   /lib/x86_64-linux-gnu/libcom_err.so
+)
+target_link_options(gatehouse PRIVATE -Wl,--no-as-needed -lcom_err)
 target_compile_options(gatehouse PRIVATE ${KRB5_CFLAGS_OTHER})
 
 target_link_libraries(gatehouse PRIVATE OpenSSL::Crypto)

@@ -7,9 +7,11 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include "app/auth.h"
+#include "infra/krb5_client.h"
 #include "app/email_sender.h"
 #include "core/crypto_aead.h"
 #include "core/hex.h"
@@ -19,6 +21,7 @@
 #include "core/url.h"
 #include "crow.h"
 #include "crow/json.h"
+#include "infra/kadm5_client.h"
 #include "infra/invite_repo.h"
 #include "infra/invite_session_repo.h"
 #include "infra/invite_otp_repo.h"
@@ -75,8 +78,12 @@ crow::response Json(int code, const crow::json::wvalue& v) {
   return r;
 }
 
-bool IsAdminUid(const std::vector<std::string>& allow, const std::string& uid) {
-  for (const auto& a : allow) {
+bool IsAdminUid(const HttpServerConfig& cfg, std::optional<infra::LdapDirectory>& ldap, const std::string& uid) {
+  if (!cfg.ldap_admin_group.empty() && ldap.has_value()) {
+    auto rc = ldap->IsUserInGroup(uid, cfg.ldap_admin_group);
+    if (rc.ok() && rc.value()) return true;
+  }
+  for (const auto& a : cfg.admin_uids) {
     if (a == uid) return true;
   }
   return false;
@@ -215,6 +222,20 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Uninvited LDAP Users</h2>
+    <div class="row">
+      <div>
+        <label>Target Tenant OU
+          <input id="uninvTenant" placeholder="k8s-20260118">
+        </label>
+      </div>
+    </div>
+    <button id="btnSearchUninvited">Find Users</button>
+    <p id="statusUninvited"></p>
+    <div id="uninvitedList"></div>
+  </div>
+
+  <div class="card">
     <h2>Latest invites</h2>
     <div class="row">
       <div>
@@ -234,8 +255,13 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
   </div>
 
 <script>
+function getCsrfToken() {
+  const m = document.cookie.match(/(?:^|;\s*)gh_csrf=([^;]+)/);
+  return m ? m[1] : '';
+}
+
 async function apiJson(method, path, body) {
-  const opt = {method, headers: {"Content-Type":"application/json"}};
+  const opt = {method, headers: {"Content-Type":"application/json", "X-CSRF-Token": getCsrfToken()}};
   if (body !== undefined) opt.body = JSON.stringify(body);
   const r = await fetch(path, opt);
   const t = await r.text();
@@ -276,36 +302,60 @@ function renderList(items) {
   }
   const table = document.createElement("table");
   const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>created</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>expires</th><th>actions</th></tr>";
+  thead.innerHTML = "<tr><th>created / dates</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>actions</th></tr>";
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
   for (const it of items) {
     const tr = document.createElement("tr");
+    
+    // Dates formatting
     const created = new Date(it.created_at * 1000).toLocaleString();
     const expires = new Date(it.expires_at * 1000).toLocaleString();
+    let datesHtml = "<div>" + created + "</div><div style='color:#555;font-size:0.85em;margin-top:4px'>Expires: " + expires + "</div>";
+    
+    if (it.consumed_at && it.consumed_at > 0) {
+        datesHtml += "<div style='color:#0a7a2f;font-size:0.85em'>Completed: " + new Date(it.consumed_at * 1000).toLocaleString() + "</div>";
+    }
+    if (it.revoked_at && it.revoked_at > 0) {
+        datesHtml += "<div style='color:#b00020;font-size:0.85em'>Revoked: " + new Date(it.revoked_at * 1000).toLocaleString() + "</div>";
+    }
+
+    // Pill color logic based on status string
+    let pillColor = "#f4f4f4";
+    let textColor = "#000";
+    if (it.status_name === "Completed") { pillColor = "#e6f4ea"; textColor = "#137333"; }
+    else if (it.status_name === "Revoked" || it.status_name === "Expired") { pillColor = "#fce8e6"; textColor = "#c5221f"; }
+    else if (it.status_name === "StepupVerified") { pillColor = "#e8f0fe"; textColor = "#1a73e8"; }
+
     tr.innerHTML =
-      "<td>" + created + "</td>" +
+      "<td>" + datesHtml + "</td>" +
       "<td><code>" + it.tenant_id + "</code></td>" +
       "<td><code>" + (it.invited_uid||"") + "</code></td>" +
       "<td>" + it.invited_email + "</td>" +
-      "<td><span class='pill'>" + it.status_name + "</span></td>" +
-      "<td>" + expires + "</td>" +
+      "<td><span class='pill' style='background:" + pillColor + ";color:" + textColor + ";font-weight:500'>" + it.status_name + "</span></td>" +
       "<td></td>";
-    const td = tr.querySelectorAll("td")[6];
+    const td = tr.querySelectorAll("td")[5];
 
-    const btnRevoke = document.createElement("button");
-    btnRevoke.textContent = "Revoke";
-    btnRevoke.style.marginRight = "8px";
-    btnRevoke.onclick = async () => {
-      const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
-      if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
-      await refresh();
-    };
-    td.appendChild(btnRevoke);
+    // Status codes: 4=Completed, 5=Expired, 6=Revoked
+    const canRevoke = it.status !== 4 && it.status !== 5 && it.status !== 6;
+    
+    if (canRevoke) {
+      const btnRevoke = document.createElement("button");
+      btnRevoke.textContent = "Revoke";
+      btnRevoke.style.marginRight = "8px";
+      btnRevoke.onclick = async () => {
+        if (!confirm("Are you sure you want to revoke this invitation for " + it.invited_email + "?")) return;
+        const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
+        if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
+        await refresh();
+      };
+      td.appendChild(btnRevoke);
+    }
 
     const btnResend = document.createElement("button");
-    btnResend.textContent = "Resend (new invite)";
+    btnResend.textContent = "Resend";
     btnResend.onclick = async () => {
+      if (!confirm("Generate a new invite link for " + it.invited_email + "?")) return;
       const r = await apiJson("POST", "/api/admin/invites", {tenant_ou: it.tenant_id, uid: it.invited_uid});
       if (!r.ok) { alert("Resend failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
       renderJson("outCreate", r.json || {});
@@ -336,6 +386,54 @@ async function refresh() {
   setStatus("statusList", "ok", "Loaded " + (j.items ? j.items.length : 0) + " invite(s).");
   renderList(j.items || []);
 }
+
+async function searchUninvited() {
+  setStatus("statusUninvited", "", "Searching LDAP...");
+  const t = document.getElementById("uninvTenant").value.trim();
+  if (!t) { setStatus("statusUninvited", "err", "Please enter a Tenant OU."); return; }
+  
+  const r = await fetch("/api/admin/uninvited?tenant_id=" + encodeURIComponent(t));
+  const j = await r.json().catch(() => null);
+  if (!r.ok) { setStatus("statusUninvited", "err", "Error: " + (j && j.error ? j.error : r.status)); return; }
+  
+  const items = j.items || [];
+  setStatus("statusUninvited", "ok", "Found " + items.length + " uninvited user(s).");
+  
+  const root = document.getElementById("uninvitedList");
+  root.innerHTML = "";
+  if (items.length === 0) return;
+  
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>uid</th><th>email</th><th>actions</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td><code>" + it.uid + "</code></td><td>" + it.mail + "</td><td></td>";
+    const td = tr.querySelectorAll("td")[2];
+    
+    const btn = document.createElement("button");
+    btn.textContent = "Send Invite";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Sending...";
+      const res = await apiJson("POST", "/api/admin/invites", {tenant_ou: t, uid: it.uid});
+      if (!res.ok) {
+        alert("Failed: " + (res.json && res.json.error ? res.json.error : res.text));
+        btn.disabled = false;
+        btn.textContent = "Send Invite";
+      } else {
+        btn.textContent = "Sent!";
+        await refresh(); // refresh the invites list below
+      }
+    };
+    td.appendChild(btn);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+document.getElementById("btnSearchUninvited").addEventListener("click", searchUninvited);
 
 document.getElementById("btnCreate").addEventListener("click", async () => {
   const tenant_ou = document.getElementById("tenant_ou").value.trim();
@@ -438,6 +536,26 @@ core::Result<void> HttpServer::Run() {
       return row;
     };
 
+    // CSRF validation helpers.
+    // Form-POSTs: check hidden field "_csrf" in the urlencoded body.
+    // JSON-API-POSTs: check "X-CSRF-Token" request header.
+    auto csrf_ok_form = [](const crow::request& req, const infra::SessionRow& s) -> bool {
+      auto tok = core::FormGet(req.body, "_csrf");
+      return tok.has_value() && !tok->empty() && *tok == s.csrf_secret_hex;
+    };
+    auto csrf_ok_header = [](const crow::request& req, const infra::SessionRow& s) -> bool {
+      const std::string tok = req.get_header_value("X-CSRF-Token");
+      return !tok.empty() && tok == s.csrf_secret_hex;
+    };
+
+    // Sets the gh_csrf readable cookie (no HttpOnly so JS can read it for XHR requests).
+    auto set_csrf_cookie = [&](crow::response& r, const std::string& csrf_hex,
+                               std::int64_t max_age) {
+      r.add_header("Set-Cookie",
+                   "gh_csrf=" + csrf_hex + "; Path=/; Max-Age=" +
+                       std::to_string(max_age) + "; SameSite=Strict");
+    };
+
     // ---- health ----
     CROW_ROUTE(app, "/api/healthz").methods("GET"_method)([this] {
       crow::json::wvalue v;
@@ -462,10 +580,16 @@ core::Result<void> HttpServer::Run() {
     });
 
     CROW_ROUTE(app, "/auth/logout").methods("POST"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (s.has_value() && !csrf_ok_form(req, *s)) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
       const std::string sid = CookieValueFromHeader(req, cfg_.session_cookie_name);
       if (!sid.empty()) (void)sessions.DeleteBySid(sid);
       auto r = RedirectTo("/login");
-      r.add_header("Set-Cookie", cfg_.session_cookie_name + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+      r.add_header("Set-Cookie",
+                   cfg_.session_cookie_name + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+      r.add_header("Set-Cookie", "gh_csrf=deleted; Path=/; Max-Age=0; SameSite=Strict");
       return r;
     });
 
@@ -480,7 +604,13 @@ core::Result<void> HttpServer::Run() {
       auto vr = auth.Verify(lr);
       if (!vr.ok() || !vr.value().has_value()) return RedirectTo("/login?err=Invalid+credentials");
 
-      const LoginPrincipal& principal = *vr.value();
+      LoginPrincipal principal = *vr.value();
+      if (ldap_dir.has_value()) {
+        auto t_res = ldap_dir->ResolveTenantByUid(principal.uid);
+        if (t_res.ok() && t_res.value().has_value()) {
+          principal.tenant_id = t_res.value().value();
+        }
+      }
       auto ticket_id = StoreTicketIfPresent(vault, master_key, principal);
       if (!ticket_id.ok()) return RedirectTo("/login?err=Internal+error");
 
@@ -505,6 +635,7 @@ core::Result<void> HttpServer::Run() {
                    cfg_.session_cookie_name + "=" + row.sid +
                        "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
                        "; HttpOnly; SameSite=Lax");
+      set_csrf_cookie(r, core::HexEncode(csrf_bytes.value()), cfg_.session_ttl_seconds);
       return r;
     });
 
@@ -513,23 +644,129 @@ core::Result<void> HttpServer::Run() {
       auto s = require_auth(req);
       if (!s.has_value()) return RedirectTo("/login");
 
-      const bool is_admin = IsAdminUid(cfg_.admin_uids, s->uid);
+      const bool is_admin = IsAdminUid(cfg_, ldap_dir, s->uid);
       std::string admin_block;
       if (is_admin) {
-        admin_block = "<p><b>Admin</b>: <a href=\"/admin/invites\">Create & manage invitations</a></p>";
+        admin_block = "<p><b>Admin</b>: ";
+        admin_block += "<a href=\"/admin/invites\">Invitations</a>";
+        admin_block += " &nbsp;|&nbsp; ";
+        admin_block += "<a href=\"/admin/tenants\">Tenant &amp; User Overview</a>";
+        admin_block += "</p>";
       }
 
-      const std::string html =
-          "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-          "<title>Gatehouse</title></head>"
-          "<body style=\"font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px\">"
-          "<h1>Gatehouse Portal</h1>"
-          "<p>Signed in as <b>" + crow::json::escape(s->uid) + "</b></p>"
-          "<p>Tenant: <b>" + crow::json::escape(s->tenant_id) + "</b></p>" +
-          admin_block +
-          "<form method=\"post\" action=\"/auth/logout\"><button type=\"submit\" style=\"padding:10px 14px\">Logout</button></form>"
-          "</body></html>";
+            std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+      html += "<title>Gatehouse Portal</title>";
+      html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px;background:#f9f9f9;color:#222}";
+      html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:24px}";
+      html += "h1{margin-top:0} .host-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-top:16px}";
+      html += ".host-card{padding:16px;border:1px solid #e0e0e0;border-radius:8px;background:#fafafa}";
+      html += ".host-card b{display:block;font-size:1.1em;color:#0b57d0} .host-card code{font-size:0.9em;color:#555;background:#eee;padding:2px 6px;border-radius:4px}";
+      html += "button{padding:10px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600}";
+      html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:600} a:hover{text-decoration:underline}";
+      html += "</style></head><body>";
+      html += "<h1>Gatehouse Portal</h1>";
+      
+      // Card: User Info
+      html += "<div class=\"card\"><h3>Identity</h3>";
+      html += "<p>Signed in as <b>" + crow::json::escape(s->uid) + "</b><br>";
+      html += "Tenant: <code>" + crow::json::escape(s->tenant_id) + "</code></p>";
+      if (!admin_block.empty()) html += admin_block;
+      html += "</div>";
+
+      // Card: Hosts (populated via JS)
+      html += "<div class=\"card\"><h3>My Infrastructure</h3>";
+      html += "<div id=\"hostContainer\"><p style=\"color:#666\">Loading hosts...</p></div>";
+      html += "</div>";
+
+      // Card: Security
+      html += "<div class=\"card\"><h3>Security</h3>";
+      html += "<p style=\"color:#555\">Manage your Kerberos account credentials.</p>";
+      html += "<a href=\"/portal/changepw\" style=\"display:inline-block;padding:10px 16px;background:#0b57d0;color:#fff;text-decoration:none;border-radius:6px;font-weight:600\">Change Password</a>";
+      html += "</div>";
+
+      // Card: Logout (CSRF token embedded)
+      html += "<form method=\"post\" action=\"/auth/logout\">";
+      html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
+      html += "<button type=\"submit\">Logout</button></form>";
+
+      // JavaScript to fetch and render hosts
+      html += "<script>";
+      html += "async function loadHosts() {";
+      html += "  const r = await fetch('/api/me/hosts');";
+      html += "  const div = document.getElementById('hostContainer');";
+      html += "  if (!r.ok) { div.innerHTML = '<p style=\"color:#b00020\">Failed to load hosts.</p>'; return; }";
+      html += "  const j = await r.json();";
+      html += "  if (!j.items || j.items.length === 0) { div.innerHTML = '<p>No managed hosts assigned to you.</p>'; return; }";
+      html += "  let h = '<div class=\"host-grid\">';";
+      html += "  for(const host of j.items) {";
+      html += "    h += '<div class=\"host-card\">';";
+      html += "    h += '<b>' + (host.hostname || 'Unknown Host') + '</b>';";
+      html += "    h += '<p style=\"margin:8px 0 0 0\"><code>' + (host.ip || 'No IP configured') + '</code></p>';";
+      html += "    h += '</div>';";
+      html += "  }";
+      html += "  h += '</div>';";
+      html += "  div.innerHTML = h;";
+      html += "}";
+      html += "loadHosts();";
+      html += "</script>";
+
+      html += "</body></html>";
       return HtmlPage(200, html);
+    });
+
+    // ---- GET & POST /portal/changepw ----
+    CROW_ROUTE(app, "/portal/changepw").methods("GET"_method, "POST"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) return RedirectTo("/login");
+
+      if (req.method == "GET"_method) {
+        const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
+        std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+        html += "<title>Change Password - Gatehouse</title>";
+        html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:540px;background:#f9f9f9;color:#222}";
+        html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}";
+        html += "label{display:block;margin-top:16px;font-weight:500;font-size:0.95em} input{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}";
+        html += "button{margin-top:24px;padding:12px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600;width:100%;font-size:1em}";
+        html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:500} a:hover{text-decoration:underline}";
+        html += "</style></head><body>";
+        html += "<p><a href=\"/portal\">&larr; Back to Dashboard</a></p>";
+        html += "<h1>Change Password</h1>";
+        html += "<div class=\"card\">";
+        if (!err.empty()) html += "<div style=\"color:#b00020;background:#fce8e6;padding:12px;border-radius:8px;margin-bottom:16px\"><b>Error:</b> " + crow::json::escape(err) + "</div>";
+        html += "<form method=\"post\" action=\"/portal/changepw\">";
+        html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
+        html += "<label>Old Password <input type=\"password\" name=\"old_password\" required autofocus></label>";
+        html += "<label>New Password <input type=\"password\" name=\"new_password\" required minlength=\"8\"></label>";
+        html += "<label>Confirm New Password <input type=\"password\" name=\"new_password_confirm\" required minlength=\"8\"></label>";
+        html += "<button type=\"submit\">Update Password</button>";
+        html += "</form></div></body></html>";
+        return HtmlPage(200, html);
+      } else {
+        // --- POST Logic ---
+        if (!csrf_ok_form(req, *s)) return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+        if (cfg_.auth_cfg.mode == AuthMode::kDemo || s->uid == "demo") {
+          return RedirectTo("/portal/changepw?err=Demo+users+cannot+change+passwords");
+        }
+
+        const std::string old_pw = core::FormGet(req.body, "old_password").value_or("");
+        const std::string new_pw = core::FormGet(req.body, "new_password").value_or("");
+        const std::string conf_pw = core::FormGet(req.body, "new_password_confirm").value_or("");
+
+        if (old_pw.empty() || new_pw.empty()) return RedirectTo("/portal/changepw?err=Missing+password+fields");
+        if (new_pw != conf_pw) return RedirectTo("/portal/changepw?err=New+passwords+do+not+match");
+
+        infra::Krb5Client krb(infra::Krb5Config{.realm = cfg_.auth_cfg.krb5_realm});
+        auto rc = krb.ChangePassword(s->uid, old_pw, new_pw);
+        
+        if (!rc.ok()) {
+          std::fprintf(stderr, "[gatehouse][changepw] KDC error for %s: %s\n",
+                       s->uid.c_str(), rc.status().ToString().c_str());
+          return RedirectTo("/portal/changepw?err=Password+change+failed."
+                            "+Check+your+old+password+and+ensure+the+new+password+meets+policy.");
+        }
+
+        return RedirectTo("/portal?ok=Password+successfully+changed");
+      }
     });
 
     CROW_ROUTE(app, "/").methods("GET"_method)([&](const crow::request& req) {
@@ -542,7 +779,7 @@ core::Result<void> HttpServer::Run() {
     CROW_ROUTE(app, "/admin/invites").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) return RedirectTo("/login");
-      if (!IsAdminUid(cfg_.admin_uids, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
       return HtmlPage(200, kAdminInvitesPage);
     });
 
@@ -565,7 +802,10 @@ core::Result<void> HttpServer::Run() {
       const auto& inv = *row.value();
 
       if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) return HtmlPage(410, "<h1>Invitation revoked</h1>");
-      if (inv.expires_at <= now) return HtmlPage(410, "<h1>Invitation expired</h1>");
+      if (inv.expires_at <= now) {
+        (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kExpired, now);
+        return HtmlPage(410, "<h1>Invitation expired</h1>");
+      }
 
       (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kLinkVerified, now);
 
@@ -603,7 +843,8 @@ core::Result<void> HttpServer::Run() {
       std::string display;
       if (prof.ok() && prof.value().has_value()) display = prof.value()->display_name;
 
-      const bool verified = invite_otps.IsVerified(is->sid).ok() ? invite_otps.IsVerified(is->sid).value() : false;
+      auto verified_res = invite_otps.IsVerified(is->sid);
+      const bool verified = verified_res.ok() && verified_res.value();
 
       const std::string sent = req.url_params.get("sent") ? req.url_params.get("sent") : "";
       const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
@@ -639,6 +880,8 @@ core::Result<void> HttpServer::Run() {
         html += "<h3>Profile</h3>";
         html += "<form method='post' action='/invite/complete'>";
         html += "<label>Display name (optional)<input name='display_name' value='" + crow::json::escape(display) + "'></label>";
+        html += "<label>New Password<input type='password' name='password' required minlength='8'></label>";
+        html += "<label>Confirm Password<input type='password' name='password_confirm' required minlength='8'></label>";
         html += "<button type='submit'>Finish</button></form>";
       }
 
@@ -656,6 +899,34 @@ core::Result<void> HttpServer::Run() {
       const auto now = core::UnixNow();
       const std::optional<std::string> dn = core::FormGet(req.body, "display_name");
       const std::string display = dn.value_or("");
+      
+      const std::string pwd1 = core::FormGet(req.body, "password").value_or("");
+      const std::string pwd2 = core::FormGet(req.body, "password_confirm").value_or("");
+      
+      if (pwd1.empty() || pwd1 != pwd2) {
+        return RedirectTo("/invite/complete?err=Passwords+do+not+match");
+      }
+
+      const char* env_kadmin_princ = std::getenv("GATEHOUSE_KADM5_ADMIN_PRINC");
+      const char* env_kadmin_pass = std::getenv("GATEHOUSE_KADM5_ADMIN_PASS");
+      
+      if (env_kadmin_princ && env_kadmin_pass && ldap_dir.has_value()) {
+        infra::Kadm5Config kcfg;
+        kcfg.realm = cfg_.auth_cfg.krb5_realm;
+        kcfg.admin_principal = env_kadmin_princ;
+        kcfg.admin_password = env_kadmin_pass;
+        infra::Kadm5Client kadm(kcfg);
+
+        auto dn_res = ldap_dir->GetUserDn(inv.value()->tenant_id, inv.value()->invited_uid);
+        if (dn_res.ok() && dn_res.value().has_value()) {
+           std::string new_princ = inv.value()->invited_uid + "@" + cfg_.auth_cfg.krb5_realm;
+           auto krc = kadm.CreatePrincipal(new_princ, pwd1, dn_res.value().value());
+           if (!krc.ok()) {
+               std::fprintf(stderr, "[gatehouse][kadm5] Failed to create principal: %s\n", krc.status().ToString().c_str());
+               return RedirectTo("/invite/complete?err=Failed+to+create+Kerberos+principal");
+           }
+        }
+      }
 
       infra::InviteProfileRow pr;
       pr.invite_id = is->invite_id;
@@ -667,16 +938,39 @@ core::Result<void> HttpServer::Run() {
       (void)invites.UpdateStatus(is->invite_id, infra::InviteStatus::kCompleted, now);
       (void)invite_sessions.Consume(is->sid, now);
 
+      // --- P3: Activate User in LDAP ---
+      if (ldap_dir.has_value() && inv.value()->invited_uid != "") {
+        auto act_rc = ldap_dir->ActivateUser(inv.value()->tenant_id, inv.value()->invited_uid);
+        if (!act_rc.ok()) {
+          std::fprintf(stderr, "[gatehouse][activate] Warning: LDAP activation failed for %s: %s\n", 
+                       inv.value()->invited_uid.c_str(), act_rc.status().ToString().c_str());
+          // Optional: You could redirect to an error page here if LDAP unlock is strictly required.
+          // For now, we log the warning and let the user complete the flow.
+        }
+      }
+      // ---------------------------------
+
       auto r = HtmlPage(200, "<h1>Done</h1><p>Your invitation is completed.</p><p><a href=\"/login\">Login</a></p>");
       r.add_header("Set-Cookie", std::string(kInviteCookie) + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
       return r;
     });
 
-    
     // ---- invite OTP step-up (email) ----
     CROW_ROUTE(app, "/invite/otp/send").methods("POST"_method)([&](const crow::request& req) {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      const std::int64_t now = core::UnixNow();
+
+      // Cooldown check (Rate Limiting)
+      auto last_issued = invite_otps.GetLastIssuedAt(is->sid);
+      if (!last_issued.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (last_issued.value().has_value()) {
+        const std::int64_t diff = now - last_issued.value().value();
+        if (diff < 60) {
+          return RedirectTo("/invite/complete?err=Please+wait+60+seconds+before+requesting+a+new+code");
+        }
+      }
 
       auto inv = invites.GetById(is->invite_id);
       if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
@@ -703,7 +997,6 @@ core::Result<void> HttpServer::Run() {
       auto otp_id_bytes = core::RandomBytes(16);
       if (!otp_id_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
-      const std::int64_t now = core::UnixNow();
       infra::InviteOtpRow o;
       o.otp_id = core::HexEncode(otp_id_bytes.value());
       o.sid = is->sid;
@@ -724,6 +1017,7 @@ core::Result<void> HttpServer::Run() {
       auto mail_rc = email->SendText(row.invited_email, subject, body_txt);
       if (!mail_rc.ok()) return HtmlPage(502, "<h1>Mail send failed</h1>");
 
+      (void)invites.UpdateStatus(row.invite_id, infra::InviteStatus::kStepupSent, now);
       return RedirectTo("/invite/complete?sent=1");
     });
 
@@ -744,10 +1038,38 @@ core::Result<void> HttpServer::Run() {
       if (!ok.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
       if (!ok.value()) return RedirectTo("/invite/complete?err=wrong+code");
 
+      // Mark step-up as verified in the invite status.
+      auto inv_otp = invites.GetById(is->invite_id);
+      if (inv_otp.ok() && inv_otp.value().has_value()) {
+        (void)invites.UpdateStatus(is->invite_id, infra::InviteStatus::kStepupVerified, now);
+      }
       return RedirectTo("/invite/complete?ok=1");
     });
 
-// ---- JSON auth + me ----
+    // ---- API: My Hosts ----
+    CROW_ROUTE(app, "/api/me/hosts").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto hr = ldap_dir->GetUserHosts(s->tenant_id, s->uid);
+      if (!hr.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=hr.status().ToString(); return Json(502, v); }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["items"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& h : hr.value()) {
+        crow::json::wvalue it;
+        it["hostname"] = h.hostname;
+        it["ip"] = h.ip;
+        it["dn"] = h.dn;
+        v["items"][idx++] = std::move(it);
+      }
+      return Json(200, v);
+    });
+
+    // ---- JSON auth + me ----
     CROW_ROUTE(app, "/api/me").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) {
@@ -779,7 +1101,13 @@ core::Result<void> HttpServer::Run() {
         crow::json::wvalue v; v["ok"]=false; v["error"]="invalid credentials"; return Json(401, v);
       }
 
-      const LoginPrincipal& principal = *vr.value();
+      LoginPrincipal principal = *vr.value();
+      if (ldap_dir.has_value()) {
+        auto t_res = ldap_dir->ResolveTenantByUid(principal.uid);
+        if (t_res.ok() && t_res.value().has_value()) {
+          principal.tenant_id = t_res.value().value();
+        }
+      }
       auto ticket_id = StoreTicketIfPresent(vault, master_key, principal);
       if (!ticket_id.ok()) {
         crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
@@ -816,14 +1144,54 @@ core::Result<void> HttpServer::Run() {
                       cfg_.session_cookie_name + "=" + row.sid +
                           "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
                           "; HttpOnly; SameSite=Lax");
+      set_csrf_cookie(resp, core::HexEncode(csrf_bytes.value()), cfg_.session_ttl_seconds);
       return resp;
     });
 
     // ---- Admin APIs ----
+
+    // ---- API: List uninvited users ----
+    CROW_ROUTE(app, "/api/admin/uninvited").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+
+      const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
+      if (tenant.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id required"; return Json(400, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto ldap_res = ldap_dir->ListUsers(tenant);
+      if (!ldap_res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=ldap_res.status().ToString(); return Json(502, v); }
+
+      auto inv_res = invites.GetInvitedUids(tenant, core::UnixNow());
+      if (!inv_res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=inv_res.status().ToString(); return Json(500, v); }
+
+      // Compute difference
+      std::vector<std::string> invited = inv_res.value();
+      auto is_invited = [&](const std::string& u) {
+          for(const auto& x : invited) if(x == u) return true;
+          return false;
+      };
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["items"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& u : ldap_res.value()) {
+          if (!is_invited(u.uid)) {
+              crow::json::wvalue it;
+              it["uid"] = u.uid;
+              it["mail"] = u.mail;
+              v["items"][idx++] = std::move(it);
+          }
+      }
+      return Json(200, v);
+    });
+
     CROW_ROUTE(app, "/api/admin/invites/list").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
-      if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
       const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
       const std::string uid = req.url_params.get("invited_uid") ? req.url_params.get("invited_uid") : "";
@@ -847,6 +1215,7 @@ core::Result<void> HttpServer::Run() {
         it["created_at"] = r.created_at;
         it["expires_at"] = r.expires_at;
         it["revoked_at"] = r.revoked_at;
+        it["consumed_at"] = r.consumed_at;
         it["created_by"] = r.created_by;
         v["items"][idx++] = std::move(it);
       }
@@ -856,7 +1225,8 @@ core::Result<void> HttpServer::Run() {
     CROW_ROUTE(app, "/api/admin/invites/revoke").methods("POST"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
-      if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
       auto body = crow::json::load(req.body);
       if (!body || !body.has("invite_id")) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json (need invite_id)"; return Json(400, v); }
@@ -872,7 +1242,8 @@ core::Result<void> HttpServer::Run() {
       try {
         auto s = require_auth(req);
         if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
-        if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+        if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+        if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
         auto body = crow::json::load(req.body);
         if (!body || !body.has("tenant_ou") || !body.has("uid")) {
@@ -898,6 +1269,9 @@ core::Result<void> HttpServer::Run() {
         if (!mail.has_value() || mail->empty()) {
           crow::json::wvalue v; v["ok"]=false; v["error"]="user not found or missing mail"; return Json(404, v);
         }
+
+        // Revoke any existing pending invites for the same tenant+uid before creating a new one.
+        (void)invites.RevokePending(tenant_ou, uid, core::UnixNow());
 
         auto token_bytes = core::RandomBytes(32);
         auto invite_id_bytes = core::RandomBytes(16);
@@ -950,7 +1324,279 @@ core::Result<void> HttpServer::Run() {
       }
     });
 
-    app.bindaddr(cfg_.bind_addr)
+    // ---- Admin: Tenant & User Overview ----
+
+    CROW_ROUTE(app, "/admin/tenants").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) return RedirectTo("/login");
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
+
+      const std::string csrf = s->csrf_secret_hex;
+      std::string html = "<!doctype html><html><head><meta charset='utf-8'>"
+                         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                         "<title>Gatehouse – Tenant Overview</title>"
+                         "<style>"
+                         "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:1100px;background:#f9f9f9;color:#222}"
+                         ".card{background:#fff;padding:20px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05);margin-bottom:20px}"
+                         "h1,h2,h3{margin-top:0} a{color:#0b57d0;font-weight:600;text-decoration:none} a:hover{text-decoration:underline}"
+                         "table{width:100%;border-collapse:collapse;margin-top:12px}"
+                         "th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;font-size:14px;vertical-align:top}"
+                         "th{font-weight:600;background:#fafafa}"
+                         "code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:0.88em}"
+                         ".host-pill{display:inline-block;background:#e8f0fe;color:#1a73e8;padding:2px 8px;border-radius:999px;font-size:12px;margin:2px 2px 2px 0}"
+                         ".err{color:#b00020} .muted{color:#777;font-size:13px}"
+                         "select{padding:8px;border-radius:6px;border:1px solid #ccc;font-size:14px;margin-right:8px}"
+                         "button{padding:9px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600}"
+                         "button:hover{background:#0842a0}"
+                         "</style></head><body>"
+                         "<h1>Tenant &amp; User Overview</h1>"
+                         "<p><a href='/portal'>&larr; Back to portal</a></p>"
+                         "<div class='card'>"
+                         "<h2>Select Tenant</h2>"
+                         "<select id='tenantSel'><option value=''>Loading...</option></select>"
+                         "<button id='btnLoad'>Load Users &amp; Hosts</button>"
+                         "<p id='status' class='muted'></p>"
+                         "</div>"
+                         "<div id='result'></div>"
+                         "<script>";
+
+      html += "const CSRF = '" + csrf + "';\n";
+      html += R"JS(
+const STATUS_NAMES = {
+  '-1': {label:'None',      bg:'#f0f0f0', fg:'#555'},
+   '0': {label:'Invited',   bg:'#fff3cd', fg:'#856404'},
+   '1': {label:'LinkVerified', bg:'#cfe2ff', fg:'#0a58ca'},
+   '2': {label:'StepupSent',   bg:'#cfe2ff', fg:'#0a58ca'},
+   '3': {label:'StepupVerified', bg:'#d1ecf1', fg:'#0c5460'},
+   '4': {label:'Completed', bg:'#d1e7dd', fg:'#0f5132'},
+   '5': {label:'Expired',   bg:'#f8d7da', fg:'#842029'},
+   '6': {label:'Revoked',   bg:'#f8d7da', fg:'#842029'},
+};
+
+function statusPill(status, expiresAt) {
+  const s = String(status);
+  const info = STATUS_NAMES[s] || {label:'Unknown', bg:'#eee', fg:'#333'};
+  let label = info.label;
+  // Mark as expired if past expiry but status is not yet set
+  if ((status === 0 || status === 1 || status === 2 || status === 3) && expiresAt > 0 && expiresAt < Date.now()/1000) {
+    label = 'Expired'; return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:#f8d7da;color:#842029">' + label + '</span>';
+  }
+  return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:' + info.bg + ';color:' + info.fg + '">' + label + '</span>';
+}
+
+async function loadTenants() {
+  const r = await fetch('/api/admin/tenants');
+  const j = await r.json().catch(() => null);
+  const sel = document.getElementById('tenantSel');
+  if (!r.ok || !j || !j.items) { sel.innerHTML = '<option>Error loading tenants</option>'; return; }
+  sel.innerHTML = '<option value="">-- choose tenant --</option>';
+  for (const t of j.items) {
+    const o = document.createElement('option');
+    o.value = t; o.textContent = t;
+    sel.appendChild(o);
+  }
+}
+
+async function sendInvite(tenantId, uid, btnEl) {
+  btnEl.disabled = true;
+  const orig = btnEl.textContent;
+  btnEl.textContent = 'Sending...';
+  const r = await fetch('/api/admin/invites', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
+    body: JSON.stringify({tenant_ou: tenantId, uid})
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    alert('Failed: ' + (j && j.error ? j.error : r.status));
+    btnEl.disabled = false;
+    btnEl.textContent = orig;
+    return;
+  }
+  // Refresh the table to show updated status
+  await loadUsers();
+}
+
+async function loadUsers() {
+  const t = document.getElementById('tenantSel').value;
+  if (!t) { document.getElementById('status').textContent = 'Please select a tenant.'; return; }
+  document.getElementById('status').textContent = 'Loading...';
+  document.getElementById('result').innerHTML = '';
+  const r = await fetch('/api/admin/tenant-users?tenant_id=' + encodeURIComponent(t),
+                        {headers: {'X-CSRF-Token': CSRF}});
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j) {
+    document.getElementById('status').textContent = 'Error: ' + (j && j.error ? j.error : r.status);
+    return;
+  }
+  const users = j.users || [];
+  document.getElementById('status').textContent = users.length + ' user(s) found.';
+
+  if (users.length === 0) {
+    document.getElementById('result').innerHTML = '<div class="card"><p>No users found in this tenant.</p></div>';
+    return;
+  }
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<h2>Users in <code>' + escHtml(t) + '</code></h2>';
+
+  const table = document.createElement('table');
+  table.innerHTML =
+    '<thead><tr><th>UID</th><th>First Name</th><th>Last Name</th><th>Email</th>' +
+    '<th>Invitation</th><th>Managed Hosts</th><th>Actions</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+
+  for (const u of users) {
+    const tr = document.createElement('tr');
+
+    // Hosts
+    let hostsHtml = '';
+    if (u.hosts && u.hosts.length > 0) {
+      for (const h of u.hosts) {
+        hostsHtml += '<span class="host-pill" title="' + escHtml(h.dn) + '">';
+        hostsHtml += escHtml(h.hostname || h.dn);
+        if (h.ip) hostsHtml += ' <code>' + escHtml(h.ip) + '</code>';
+        hostsHtml += '</span>';
+      }
+    } else {
+      hostsHtml = '<span class="muted">—</span>';
+    }
+
+    // Invite status
+    const st = u.invite_status;
+    let invHtml = statusPill(st, u.invite_expires_at);
+    if (st >= 0 && u.invite_created_at > 0) {
+      invHtml += '<br><span class="muted">' + new Date(u.invite_created_at * 1000).toLocaleDateString() + '</span>';
+    }
+    if (u.invite_expires_at > 0 && st !== 4) {
+      const exp = new Date(u.invite_expires_at * 1000);
+      invHtml += '<br><span class="muted" title="Expires">exp: ' + exp.toLocaleDateString() + '</span>';
+    }
+
+    tr.innerHTML =
+      '<td><code>' + escHtml(u.uid) + '</code></td>' +
+      '<td>' + escHtml(u.given_name) + '</td>' +
+      '<td>' + escHtml(u.surname) + '</td>' +
+      '<td>' + escHtml(u.mail) + '</td>' +
+      '<td>' + invHtml + '</td>' +
+      '<td>' + hostsHtml + '</td>' +
+      '<td></td>';
+
+    // Action button
+    const td = tr.querySelectorAll('td')[6];
+    const isActive = st === 0 || st === 1 || st === 2 || st === 3;
+    const isCompleted = st === 4;
+    if (!isCompleted) {
+      const btn = document.createElement('button');
+      btn.textContent = isActive ? 'Resend' : 'Send Invite';
+      btn.style.cssText = 'padding:5px 10px;font-size:13px;';
+      btn.onclick = () => sendInvite(t, u.uid, btn);
+      td.appendChild(btn);
+    }
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  card.appendChild(table);
+  document.getElementById('result').appendChild(card);
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+document.getElementById('btnLoad').addEventListener('click', loadUsers);
+loadTenants();
+)JS";
+      html += "</script></body></html>";
+      return HtmlPage(200, html);
+    });
+
+    CROW_ROUTE(app, "/api/admin/tenants").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto res = ldap_dir->ListTenants();
+      if (!res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=res.status().ToString(); return Json(502, v); }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["items"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& t : res.value()) {
+        v["items"][idx++] = t;
+      }
+      return Json(200, v);
+    });
+
+    CROW_ROUTE(app, "/api/admin/tenant-users").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
+      if (tenant.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id required"; return Json(400, v); }
+
+      auto res = ldap_dir->ListUsersWithHosts(tenant);
+      if (!res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=res.status().ToString(); return Json(502, v); }
+
+      // Build uid -> latest invite map.
+      auto inv_res = invites.GetLatestPerUid(tenant);
+      std::unordered_map<std::string, infra::InviteRow> inv_map;
+      if (inv_res.ok()) {
+        for (auto& row : inv_res.value()) {
+          inv_map[row.invited_uid] = std::move(row);
+        }
+      }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["tenant_id"] = tenant;
+      v["users"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& u : res.value()) {
+        crow::json::wvalue uj;
+        uj["uid"]        = u.uid;
+        uj["given_name"] = u.given_name;
+        uj["surname"]    = u.surname;
+        uj["mail"]       = u.mail;
+
+        auto it = inv_map.find(u.uid);
+        if (it != inv_map.end()) {
+          const auto& inv = it->second;
+          uj["invite_id"]          = inv.invite_id;
+          uj["invite_status"]      = static_cast<int>(inv.status);
+          uj["invite_status_name"] = InviteStatusName(inv.status);
+          uj["invite_expires_at"]  = inv.expires_at;
+          uj["invite_created_at"]  = inv.created_at;
+        } else {
+          uj["invite_status"]      = -1;
+          uj["invite_status_name"] = "None";
+          uj["invite_expires_at"]  = 0;
+          uj["invite_created_at"]  = 0;
+        }
+
+        uj["hosts"] = crow::json::wvalue::list();
+        unsigned int hidx = 0;
+        for (const auto& h : u.hosts) {
+          crow::json::wvalue hj;
+          hj["dn"]       = h.dn;
+          hj["hostname"] = h.hostname;
+          hj["ip"]       = h.ip;
+          uj["hosts"][hidx++] = std::move(hj);
+        }
+        v["users"][idx++] = std::move(uj);
+      }
+      return Json(200, v);
+    });
+
+        app.bindaddr(cfg_.bind_addr)
         .port(static_cast<std::uint16_t>(cfg_.port))
         .concurrency(cfg_.threads)
         .run();

@@ -17,6 +17,18 @@ core::Status MakeStmtStatus(int rc, sqlite3* db, const char* what) {
                             std::string(what) + " (rc=" + std::to_string(rc) + "): " + msg);
 }
 
+std::string BlobToHex(const void* data, int size) {
+  const auto* bytes = static_cast<const std::uint8_t*>(data);
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(static_cast<std::size_t>(size) * 2);
+  for (int i = 0; i < size; ++i) {
+    out += kHex[bytes[i] >> 4];
+    out += kHex[bytes[i] & 0xf];
+  }
+  return out;
+}
+
 }  // namespace
 
 SessionRepo::SessionRepo(SqliteDb& db) : db_(db) {}
@@ -66,8 +78,9 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
 
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
-      "SELECT sid,uid,tenant_id,created_at,expires_at,mfa_state,COALESCE(ticket_id,'') "
-      "FROM auth_session WHERE sid=?;";
+      "SELECT sid,uid,tenant_id,created_at,expires_at,mfa_state,COALESCE(ticket_id,''),"
+      "csrf_secret "
+      "FROM auth_session WHERE sid=?";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
     return core::Result<std::optional<SessionRow>>::Err(MakeStmtStatus(rc, dbh, "prepare(get)"));
@@ -85,6 +98,11 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
     row.expires_at = sqlite3_column_int64(stmt, 4);
     row.mfa_state = sqlite3_column_int(stmt, 5);
     row.ticket_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+    const void* csrf_blob = sqlite3_column_blob(stmt, 7);
+    const int csrf_size = sqlite3_column_bytes(stmt, 7);
+    if (csrf_blob != nullptr && csrf_size > 0) {
+      row.csrf_secret_hex = BlobToHex(csrf_blob, csrf_size);
+    }
     sqlite3_finalize(stmt);
     return core::Result<std::optional<SessionRow>>::Ok(std::optional<SessionRow>(std::move(row)));
   }

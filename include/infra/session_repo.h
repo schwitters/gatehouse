@@ -19,7 +19,8 @@ struct SessionRow {
   std::int32_t mfa_state{0};
 
   // New in schema v2
-  std::string ticket_id;  // may be empty (demo mode)
+  std::string ticket_id;       // may be empty (demo mode)
+  std::string csrf_secret_hex; // hex-encoded 32-byte CSRF secret (populated by GetBySid)
 };
 
 class SessionRepo final {
