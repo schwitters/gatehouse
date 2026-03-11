@@ -44,6 +44,33 @@ namespace {
 
 constexpr const char* kInviteCookie = "gh_inv_sid";
 
+std::string ApplyTitle(const char* tmpl, const std::string& title) {
+  std::string out = tmpl;
+  const std::string placeholder = "%TITLE%";
+  std::size_t pos = 0;
+  while ((pos = out.find(placeholder, pos)) != std::string::npos) {
+    out.replace(pos, placeholder.size(), title);
+    pos += title.size();
+  }
+  return out;
+}
+
+// LOW-05: Strip non-printable / control characters before writing to logs
+// to prevent ANSI escape injection in terminals or log-management systems.
+std::string SanitizeForLog(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char ch : s) {
+    const auto c = static_cast<unsigned char>(ch);
+    if (c >= 0x20u && c != 0x7fu) {
+      out += ch;
+    } else {
+      out += '?';
+    }
+  }
+  return out;
+}
+
 std::string CookieValueFromHeader(const crow::request& req, const std::string& cookie_name) {
   const std::string cookie = req.get_header_value("Cookie");
   if (cookie.empty()) return {};
@@ -63,6 +90,13 @@ crow::response HtmlPage(int code, const std::string& html) {
   r.set_header("X-Content-Type-Options", "nosniff");
   r.set_header("X-Frame-Options", "DENY");
   r.set_header("Referrer-Policy", "strict-origin-when-cross-origin");
+  // HIGH-05: Minimal Content-Security-Policy. Inline scripts/styles are used
+  // throughout so 'unsafe-inline' is required until they are extracted.
+  r.set_header("Content-Security-Policy",
+               "default-src 'self'; "
+               "script-src 'self' 'unsafe-inline'; "
+               "style-src 'self' 'unsafe-inline'; "
+               "img-src 'self' data:");
   r.body = html;
   return r;
 }
@@ -159,7 +193,7 @@ std::string InviteStatusName(infra::InviteStatus s) {
 
 const char* kLoginPageTemplate = R"LOGIN(<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gatehouse Login</title>
+<title>%TITLE% Login</title>
 <style>
 body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:640px}
 label{display:block;margin-top:16px} input{width:100%;padding:10px;margin-top:6px}
@@ -169,7 +203,7 @@ button{margin-top:16px;padding:10px 14px}
 code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
 </style></head>
 <body>
-<h1>Gatehouse</h1>
+<h1>%TITLE%</h1>
 <form method="post" action="/auth/login">
   <label>Username <input name="username" autocomplete="username" required></label>
   <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
@@ -183,7 +217,7 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gatehouse Admin – Invitations</title>
+  <title>%TITLE% – Invitations</title>
   <style>
     body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:980px}
     label{display:block;margin-top:14px}
@@ -354,6 +388,8 @@ function renderList(items) {
         await refresh();
       };
       td.appendChild(btnRevoke);
+    } else if (it.invited_uid && it.tenant_id) {
+      checkAndAddResetBtn(td, it.tenant_id, it.invited_uid);
     }
 
     const btnResend = document.createElement("button");
@@ -372,6 +408,23 @@ function renderList(items) {
   }
   table.appendChild(tbody);
   root.appendChild(table);
+}
+
+async function checkAndAddResetBtn(td, tenant_id, uid) {
+  try {
+    const r = await apiJson("GET", "/api/admin/user/krb-status?tenant_id=" + encodeURIComponent(tenant_id) + "&uid=" + encodeURIComponent(uid));
+    if (!r.ok || !r.json || !r.json.has_krb_attrs) return;
+    const btn = document.createElement("button");
+    btn.textContent = "Reset Kerberos";
+    btn.style.cssText = "margin-right:8px;background:#d93025;";
+    btn.onclick = async () => {
+      if (!confirm("Delete Kerberos attributes for " + uid + "?\n\nThis removes: krbPrincipalName, krbPrincipalKey, krbExtraData, krbLastPwdChange, krbLoginFailedCount")) return;
+      const res = await apiJson("POST", "/api/admin/user/reset-krb", {tenant_id, uid});
+      if (!res.ok) { alert("Reset failed: " + (res.json && res.json.error ? res.json.error : res.text)); return; }
+      btn.remove();
+    };
+    td.insertBefore(btn, td.firstChild);
+  } catch(e) {}
 }
 
 async function refresh() {
@@ -522,8 +575,15 @@ core::Result<void> HttpServer::Run() {
     std::unordered_map<std::string, std::pair<int, std::int64_t>> login_attempts;
     constexpr int kLoginMaxAttempts = 10;
     constexpr std::int64_t kLoginWindowSecs = 300;
+    // MED-07: Hard cap on map size to prevent memory exhaustion from IP spoofing.
+    constexpr std::size_t kLoginMapMaxSize = 100000;
     auto check_login_rate_limit = [&](const std::string& ip) -> bool {
       std::lock_guard<std::mutex> lk(login_rl_mutex);
+      // If the map is at capacity and this IP is new, reject the request.
+      if (login_attempts.size() >= kLoginMapMaxSize &&
+          login_attempts.find(ip) == login_attempts.end()) {
+        return false;
+      }
       auto& entry = login_attempts[ip];
       const std::int64_t now_ts = core::UnixNow();
       if (now_ts - entry.second > kLoginWindowSecs) {
@@ -594,6 +654,16 @@ core::Result<void> HttpServer::Run() {
                        std::to_string(max_age) + "; SameSite=Strict");
     };
 
+    // ---- robots.txt ----
+    // LOW-07: Instruct crawlers to stay out of admin and API paths.
+    CROW_ROUTE(app, "/robots.txt").methods("GET"_method)([] {
+      crow::response r;
+      r.code = 200;
+      r.set_header("Content-Type", "text/plain");
+      r.body = "User-agent: *\nDisallow: /admin\nDisallow: /api\nDisallow: /portal\nDisallow: /invite\n";
+      return r;
+    });
+
     // ---- health ----
     CROW_ROUTE(app, "/api/healthz").methods("GET"_method)([this] {
       crow::json::wvalue v;
@@ -603,9 +673,9 @@ core::Result<void> HttpServer::Run() {
     });
 
     // ---- HTML login ----
-    CROW_ROUTE(app, "/login").methods("GET"_method)([](const crow::request& req) {
+    CROW_ROUTE(app, "/login").methods("GET"_method)([&](const crow::request& req) {
       const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
-      std::string page = kLoginPageTemplate;
+      std::string page = ApplyTitle(kLoginPageTemplate, cfg_.instance_title);
       if (!err.empty()) {
         const std::string block = std::string("<div class=\"err\">") + crow::json::escape(err) + "</div>";
         const std::size_t pos = page.find("%ERROR%");
@@ -677,7 +747,8 @@ core::Result<void> HttpServer::Run() {
       r.add_header("Set-Cookie",
                    cfg_.session_cookie_name + "=" + row.sid +
                        "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
-                       "; HttpOnly; SameSite=Lax");
+                       "; HttpOnly; SameSite=Lax" +
+                       (cfg_.secure_cookies ? "; Secure" : ""));
       set_csrf_cookie(r, core::HexEncode(csrf_bytes.value()), cfg_.session_ttl_seconds);
       return r;
     });
@@ -698,7 +769,7 @@ core::Result<void> HttpServer::Run() {
       }
 
             std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-      html += "<title>Gatehouse Portal</title>";
+      html += "<title>" + cfg_.instance_title + " Portal</title>";
       html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px;background:#f9f9f9;color:#222}";
       html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:24px}";
       html += "h1{margin-top:0} .host-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-top:16px}";
@@ -707,7 +778,7 @@ core::Result<void> HttpServer::Run() {
       html += "button{padding:10px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600}";
       html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:600} a:hover{text-decoration:underline}";
       html += "</style></head><body>";
-      html += "<h1>Gatehouse Portal</h1>";
+      html += "<h1>" + cfg_.instance_title + " Portal</h1>";
       
       // Card: User Info
       html += "<div class=\"card\"><h3>Identity</h3>";
@@ -734,21 +805,32 @@ core::Result<void> HttpServer::Run() {
 
       // JavaScript to fetch and render hosts
       html += "<script>";
+      // MED-08: Use DOM APIs with textContent to avoid innerHTML XSS from LDAP data.
+      html += "function escH(s){if(!s)return '';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}";
       html += "async function loadHosts() {";
       html += "  const r = await fetch('/api/me/hosts');";
       html += "  const div = document.getElementById('hostContainer');";
       html += "  if (!r.ok) { div.innerHTML = '<p style=\"color:#b00020\">Failed to load hosts.</p>'; return; }";
       html += "  const j = await r.json();";
       html += "  if (!j.items || j.items.length === 0) { div.innerHTML = '<p>No managed hosts assigned to you.</p>'; return; }";
-      html += "  let h = '<div class=\"host-grid\">';";
+      html += "  const grid = document.createElement('div');";
+      html += "  grid.className = 'host-grid';";
       html += "  for(const host of j.items) {";
-      html += "    h += '<div class=\"host-card\">';";
-      html += "    h += '<b>' + (host.hostname || 'Unknown Host') + '</b>';";
-      html += "    h += '<p style=\"margin:8px 0 0 0\"><code>' + (host.ip || 'No IP configured') + '</code></p>';";
-      html += "    h += '</div>';";
+      html += "    const card = document.createElement('div');";
+      html += "    card.className = 'host-card';";
+      html += "    const b = document.createElement('b');";
+      html += "    b.textContent = host.hostname || 'Unknown Host';";
+      html += "    const p = document.createElement('p');";
+      html += "    p.style.cssText = 'margin:8px 0 0 0';";
+      html += "    const code = document.createElement('code');";
+      html += "    code.textContent = host.ip || 'No IP configured';";
+      html += "    p.appendChild(code);";
+      html += "    card.appendChild(b);";
+      html += "    card.appendChild(p);";
+      html += "    grid.appendChild(card);";
       html += "  }";
-      html += "  h += '</div>';";
-      html += "  div.innerHTML = h;";
+      html += "  div.innerHTML = '';";
+      html += "  div.appendChild(grid);";
       html += "}";
       html += "loadHosts();";
       html += "</script>";
@@ -765,7 +847,7 @@ core::Result<void> HttpServer::Run() {
       if (req.method == "GET"_method) {
         const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
         std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-        html += "<title>Change Password - Gatehouse</title>";
+        html += "<title>Change Password – " + cfg_.instance_title + "</title>";
         html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:540px;background:#f9f9f9;color:#222}";
         html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}";
         html += "label{display:block;margin-top:16px;font-weight:500;font-size:0.95em} input{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}";
@@ -820,7 +902,7 @@ core::Result<void> HttpServer::Run() {
       auto s = require_auth(req);
       if (!s.has_value()) return RedirectTo("/login");
       if (!IsAdminUid(cfg_, ldap_dir, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
-      return HtmlPage(200, kAdminInvitesPage);
+      return HtmlPage(200, ApplyTitle(kAdminInvitesPage, cfg_.instance_title));
     });
 
     // ---- invite accept -> invite_session cookie -> /invite/complete ----
@@ -894,7 +976,7 @@ core::Result<void> HttpServer::Run() {
 
     // ---- invite complete GET/POST ----
 
-    // ---- invite complete GET (with email OTP step-up) ----
+    // ---- invite complete GET (wizard) ----
     CROW_ROUTE(app, "/invite/complete").methods("GET"_method)([&](const crow::request& req) {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1><p>Please open your invite link again.</p>");
@@ -912,49 +994,106 @@ core::Result<void> HttpServer::Run() {
       const bool verified = verified_res.ok() && verified_res.value();
 
       const std::string sent = req.url_params.get("sent") ? req.url_params.get("sent") : "";
-      const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
-      const std::string ok = req.url_params.get("ok") ? req.url_params.get("ok") : "";
+      const std::string err  = req.url_params.get("err")  ? req.url_params.get("err")  : "";
 
-      std::string msg;
-      if (!err.empty()) msg = "<p style='color:#b00020'>Error: " + crow::json::escape(err) + "</p>";
-      else if (!ok.empty()) msg = "<p style='color:#0a7a2f'>Verified.</p>";
-      else if (!sent.empty()) msg = "<p style='color:#555'>Code sent. Check your email.</p>";
+      // Determine wizard step:
+      // 1 = send code  2 = enter code  3 = set password
+      const int wizard_step = verified ? 3 : (!sent.empty() ? 2 : 1);
+
+      // Use the invite session SID as CSRF token: HttpOnly, embedded in HTML by server.
+      const std::string inv_csrf = crow::json::escape(is->sid);
+
+      auto wstep_class = [&](int n) -> std::string {
+        if (n < wizard_step) return "wstep done";
+        if (n == wizard_step) return "wstep active";
+        return "wstep";
+      };
 
       std::string html;
-      html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-      html += "<title>Complete invitation</title><style>";
-      html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px}";
-      html += "label{display:block;margin-top:14px} input{width:100%;padding:10px;margin-top:6px}";
-      html += "button{margin-top:12px;padding:10px 14px} .card{padding:16px;border:1px solid #ddd;border-radius:12px}";
-      html += ".muted{color:#555} code{background:#f4f4f4;padding:2px 6px;border-radius:6px}";
-      html += "</style></head><body>";
-      html += "<h1>Complete invitation</h1>";
-      html += "<div class='card'>";
-      html += "<p class='muted'>Tenant: <b>" + crow::json::escape(row.tenant_id) + "</b></p>";
-      html += "<p class='muted'>User: <b>" + crow::json::escape(row.invited_uid) + "</b></p>";
-      html += "<p class='muted'>Email: <b>" + crow::json::escape(row.invited_email) + "</b></p>";
-      html += msg;
+      html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+      html += "<title>Complete Invitation \xe2\x80\x93 " + cfg_.instance_title + "</title><style>";
+      html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f0f4f9;color:#222}";
+      html += ".wrap{max-width:520px;margin:48px auto;padding:0 16px}";
+      html += "h1{font-size:1.5rem;margin:0 0 4px}";
+      html += ".subtitle{color:#555;font-size:.9em;margin:0 0 28px}";
+      html += ".wizard{display:flex;margin-bottom:32px;border-radius:10px;overflow:hidden;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.08)}";
+      html += ".wstep{flex:1;text-align:center;padding:12px 6px;font-size:12px;font-weight:500;color:#aaa;border-bottom:3px solid transparent;transition:all .2s}";
+      html += ".wstep.done{color:#137333;border-bottom-color:#137333}";
+      html += ".wstep.active{color:#0b57d0;border-bottom-color:#0b57d0;font-weight:700}";
+      html += ".card{background:#fff;padding:28px 28px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);margin-bottom:20px}";
+      html += "h2{margin:0 0 8px;font-size:1.15rem}";
+      html += ".info-row{display:flex;gap:6px;align-items:center;font-size:.88em;color:#555;margin-bottom:4px}";
+      html += ".info-row b{color:#222}";
+      html += "label{display:block;margin-top:18px;font-size:.9em;font-weight:600;color:#333}";
+      html += "input{width:100%;padding:11px 12px;margin-top:6px;border:1px solid #ccc;border-radius:7px;font-size:1em;box-sizing:border-box;transition:border-color .15s}";
+      html += "input:focus{outline:none;border-color:#0b57d0;box-shadow:0 0 0 3px rgba(11,87,208,.12)}";
+      html += ".code-input{letter-spacing:6px;font-size:1.6em;text-align:center}";
+      html += ".btn{display:inline-block;margin-top:20px;padding:12px 20px;border:none;border-radius:7px;font-size:1em;font-weight:600;cursor:pointer;width:100%;text-align:center}";
+      html += ".btn-primary{background:#0b57d0;color:#fff} .btn-primary:hover{background:#0842a0}";
+      html += ".btn-ghost{background:#f0f0f0;color:#333;margin-top:12px} .btn-ghost:hover{background:#e0e0e0}";
+      html += ".alert-err{background:#fce8e6;color:#c5221f;border-radius:7px;padding:10px 14px;margin-top:14px;font-size:.9em}";
+      html += ".alert-info{background:#e8f0fe;color:#1a73e8;border-radius:7px;padding:10px 14px;margin-top:14px;font-size:.9em}";
+      html += "a{color:#0b57d0;font-weight:600}";
+      html += "</style></head><body><div class='wrap'>";
 
-      // Use the invite session SID as CSRF token: it is HttpOnly so external JS cannot
-      // read it, but the server embeds it in HTML and validates it on every POST.
-      const std::string inv_csrf = crow::json::escape(is->sid);
-      if (!verified) {
-        html += "<h3>Verify email</h3>";
+      html += "<h1>Complete Invitation</h1>";
+      html += "<p class='subtitle'>Tenant: <b>" + crow::json::escape(row.tenant_id) + "</b> &nbsp;&middot;&nbsp; User: <b>" + crow::json::escape(row.invited_uid) + "</b></p>";
+
+      html += "<div class='wizard'>";
+      html += "<div class='" + wstep_class(1) + "'>1. Verify Email</div>";
+      html += "<div class='" + wstep_class(2) + "'>2. Enter Code</div>";
+      html += "<div class='" + wstep_class(3) + "'>3. Set Password</div>";
+      html += "</div>";
+
+      if (wizard_step == 1) {
+        // Step 1: Send verification code
+        html += "<div class='card'>";
+        html += "<h2>Verify your email address</h2>";
+        html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We'll send a 6-digit code to:</p>";
+        html += "<div class='info-row' style='margin-top:8px'><b>" + crow::json::escape(row.invited_email) + "</b></div>";
+        if (!err.empty()) {
+          html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
+        }
         html += "<form method='post' action='/invite/otp/send'>";
         html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-        html += "<button type='submit'>Send code</button></form>";
+        html += "<button type='submit' class='btn btn-primary'>Send Verification Code</button>";
+        html += "</form></div>";
+      } else if (wizard_step == 2) {
+        // Step 2: Enter code
+        html += "<div class='card'>";
+        html += "<h2>Enter verification code</h2>";
+        html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We sent a 6-digit code to <b>" + crow::json::escape(row.invited_email) + "</b>.<br>It expires in 10&nbsp;minutes.</p>";
+        if (!err.empty()) {
+          html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
+        }
         html += "<form method='post' action='/invite/otp/verify'>";
         html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-        html += "<label>Code<input name='code' placeholder='123456' autocomplete='one-time-code'></label>";
-        html += "<button type='submit'>Verify</button></form>";
+        html += "<label>Verification code";
+        html += "<input name='code' class='code-input' placeholder='123456' autocomplete='one-time-code' inputmode='numeric' maxlength='6' required></label>";
+        html += "<button type='submit' class='btn btn-primary'>Verify Code</button>";
+        html += "</form>";
+        html += "<form method='post' action='/invite/otp/send'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
+        html += "<button type='submit' class='btn btn-ghost'>Resend Code</button>";
+        html += "</form></div>";
       } else {
-        html += "<h3>Profile</h3>";
+        // Step 3: Set password
+        html += "<div class='card'>";
+        html += "<h2>Set up your account</h2>";
+        html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>Email verified. Choose a password to complete your registration.</p>";
+        if (!err.empty()) {
+          html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
+        }
         html += "<form method='post' action='/invite/complete'>";
         html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-        html += "<label>Display name (optional)<input name='display_name' value='" + crow::json::escape(display) + "'></label>";
-        html += "<label>New Password<input type='password' name='password' required minlength='8'></label>";
-        html += "<label>Confirm Password<input type='password' name='password_confirm' required minlength='8'></label>";
-        html += "<button type='submit'>Finish</button></form>";
+        html += "<label>Display name <span style='color:#aaa;font-weight:400'>(optional)</span>";
+        html += "<input name='display_name' placeholder='Your full name' value='" + crow::json::escape(display) + "'></label>";
+        html += "<label>New password <span style='color:#b00020'>*</span>";
+        html += "<input type='password' name='password' required minlength='8' autocomplete='new-password'></label>";
+        html += "<label>Confirm password <span style='color:#b00020'>*</span>";
+        html += "<input type='password' name='password_confirm' required minlength='8' autocomplete='new-password'></label>";
+        html += "<button type='submit' class='btn btn-primary'>Complete Setup</button>";
+        html += "</form></div>";
       }
 
       html += "</div></body></html>";
@@ -968,6 +1107,13 @@ core::Result<void> HttpServer::Run() {
       const auto csrf_val = core::FormGet(req.body, "_csrf");
       if (!csrf_val.has_value() || *csrf_val != is->sid) {
         return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
+
+      // HIGH-06: Verify OTP step-up before proceeding. Without this check an
+      // attacker could POST directly to /invite/complete and skip email verification.
+      auto verified_res = invite_otps.IsVerified(is->sid);
+      if (!verified_res.ok() || !verified_res.value()) {
+        return RedirectTo("/invite/complete?err=Email+verification+required");
       }
 
       auto inv = invites.GetById(is->invite_id);
@@ -999,7 +1145,8 @@ core::Result<void> HttpServer::Run() {
            std::string new_princ = inv.value()->invited_uid + "@" + cfg_.auth_cfg.krb5_realm;
            auto krc = kadm.CreatePrincipal(new_princ, pwd1, dn_res.value().value());
            if (!krc.ok()) {
-               std::fprintf(stderr, "[gatehouse][kadm5] Failed to create principal: %s\n", krc.status().ToString().c_str());
+               std::fprintf(stderr, "[gatehouse][kadm5] Failed to create principal: %s\n",
+                            SanitizeForLog(krc.status().ToString()).c_str());
                return RedirectTo("/invite/complete?err=Failed+to+create+Kerberos+principal");
            }
         }
@@ -1019,15 +1166,44 @@ core::Result<void> HttpServer::Run() {
       if (ldap_dir.has_value() && inv.value()->invited_uid != "") {
         auto act_rc = ldap_dir->ActivateUser(inv.value()->tenant_id, inv.value()->invited_uid);
         if (!act_rc.ok()) {
-          std::fprintf(stderr, "[gatehouse][activate] Warning: LDAP activation failed for %s: %s\n", 
-                       inv.value()->invited_uid.c_str(), act_rc.status().ToString().c_str());
+          std::fprintf(stderr, "[gatehouse][activate] Warning: LDAP activation failed for %s: %s\n",
+                       SanitizeForLog(inv.value()->invited_uid).c_str(),
+                       SanitizeForLog(act_rc.status().ToString()).c_str());
           // Optional: You could redirect to an error page here if LDAP unlock is strictly required.
           // For now, we log the warning and let the user complete the flow.
         }
       }
       // ---------------------------------
 
-      auto r = HtmlPage(200, "<h1>Done</h1><p>Your invitation is completed.</p><p><a href=\"/login\">Login</a></p>");
+      std::string done_html;
+      done_html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+      done_html += "<title>Setup Complete \xe2\x80\x93 " + cfg_.instance_title + "</title><style>";
+      done_html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f0f4f9;color:#222}";
+      done_html += ".wrap{max-width:520px;margin:48px auto;padding:0 16px}";
+      done_html += "h1{font-size:1.5rem;margin:0 0 4px}";
+      done_html += ".subtitle{color:#555;font-size:.9em;margin:0 0 28px}";
+      done_html += ".wizard{display:flex;margin-bottom:32px;border-radius:10px;overflow:hidden;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.08)}";
+      done_html += ".wstep{flex:1;text-align:center;padding:12px 6px;font-size:12px;font-weight:500;color:#137333;border-bottom:3px solid #137333}";
+      done_html += ".card{background:#fff;padding:28px 28px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07)}";
+      done_html += ".check{font-size:3rem;text-align:center;margin-bottom:16px}";
+      done_html += "h2{margin:0 0 12px;font-size:1.15rem;text-align:center}";
+      done_html += ".btn{display:inline-block;margin-top:20px;padding:12px 20px;border:none;border-radius:7px;font-size:1em;font-weight:600;cursor:pointer;width:100%;text-align:center;text-decoration:none}";
+      done_html += ".btn-primary{background:#0b57d0;color:#fff} .btn-primary:hover{background:#0842a0}";
+      done_html += "</style></head><body><div class='wrap'>";
+      done_html += "<h1>Complete Invitation</h1><p class='subtitle'>&nbsp;</p>";
+      done_html += "<div class='wizard'>";
+      done_html += "<div class='wstep'>1. Verify Email</div>";
+      done_html += "<div class='wstep'>2. Enter Code</div>";
+      done_html += "<div class='wstep'>3. Set Password</div>";
+      done_html += "</div>";
+      done_html += "<div class='card'>";
+      done_html += "<div class='check'>\xe2\x9c\x93</div>";
+      done_html += "<h2>You're all set!</h2>";
+      done_html += "<p style='text-align:center;color:#555;font-size:.93em'>Your invitation has been completed. You can now sign in with your new credentials.</p>";
+      done_html += "<a href='/login' class='btn btn-primary'>Sign In</a>";
+      done_html += "</div></div></body></html>";
+
+      auto r = HtmlPage(200, done_html);
       r.add_header("Set-Cookie", std::string(kInviteCookie) + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
       return r;
     });
@@ -1058,14 +1234,22 @@ core::Result<void> HttpServer::Run() {
       if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
       const auto& row = *inv.value();
 
-      // Create 6-digit OTP.
-      auto rnd = core::RandomBytes(4);
-      if (!rnd.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
-      const unsigned int v = (static_cast<unsigned int>(rnd.value()[0]) << 24) |
-                             (static_cast<unsigned int>(rnd.value()[1]) << 16) |
-                             (static_cast<unsigned int>(rnd.value()[2]) << 8) |
-                             (static_cast<unsigned int>(rnd.value()[3]) << 0);
-      const unsigned int code = (v % 900000U) + 100000U;
+      // Create 6-digit OTP using rejection-sampling to eliminate modular bias.
+      // HIGH-03: Without rejection-sampling, values 0..UINT_MAX%900000 have
+      // a marginally higher probability than the rest.
+      constexpr unsigned int kRange = 900000U;
+      constexpr unsigned int kLimit = ((~0U) - (~0U) % kRange);
+      unsigned int v = 0;
+      for (int attempt = 0; attempt < 32; ++attempt) {
+        auto rnd = core::RandomBytes(4);
+        if (!rnd.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+        v = (static_cast<unsigned int>(rnd.value()[0]) << 24) |
+            (static_cast<unsigned int>(rnd.value()[1]) << 16) |
+            (static_cast<unsigned int>(rnd.value()[2]) << 8) |
+            (static_cast<unsigned int>(rnd.value()[3]) << 0);
+        if (v < kLimit) break;
+      }
+      const unsigned int code = (v % kRange) + 100000U;
       const std::string otp = std::to_string(code);
 
       // Hash OTP.
@@ -1091,9 +1275,9 @@ core::Result<void> HttpServer::Run() {
       auto ins = invite_otps.Insert(o);
       if (!ins.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
-      const std::string subject = "Gatehouse verification code";
+      const std::string subject = "[" + cfg_.instance_title + "] Your email verification code";
       const std::string body_txt =
-          "Your Gatehouse verification code is:\n\n" + otp + "\n\n"
+          "Your " + cfg_.instance_title + " verification code is:\n\n" + otp + "\n\n"
           "It expires in 10 minutes.\n";
 
       auto mail_rc = email->SendText(row.invited_email, subject, body_txt);
@@ -1235,7 +1419,8 @@ core::Result<void> HttpServer::Run() {
       resp.add_header("Set-Cookie",
                       cfg_.session_cookie_name + "=" + row.sid +
                           "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
-                          "; HttpOnly; SameSite=Lax");
+                          "; HttpOnly; SameSite=Lax" +
+                          (cfg_.secure_cookies ? "; Secure" : ""));
       set_csrf_cookie(resp, core::HexEncode(csrf_bytes.value()), cfg_.session_ttl_seconds);
       return resp;
     });
@@ -1329,8 +1514,75 @@ core::Result<void> HttpServer::Run() {
       const std::string invite_id = std::string(body["invite_id"].s());
       if (invite_id.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="invite_id empty"; return Json(400, v); }
 
+      // Fetch invite data before revoking so we have tenant_id and uid for LDAP cleanup.
+      std::string inv_tenant_id, inv_uid;
+      {
+        auto inv = invites.GetById(invite_id);
+        if (inv.ok() && inv.value().has_value()) {
+          inv_tenant_id = inv.value()->tenant_id;
+          inv_uid = inv.value()->invited_uid;
+        }
+      }
+
       auto rc = invites.Revoke(invite_id, core::UnixNow());
       if (!rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=rc.status().ToString(); return Json(500, v); }
+
+      // Delete Kerberos principal attributes from LDAP when revoking.
+      if (ldap_dir.has_value() && !inv_tenant_id.empty() && !inv_uid.empty()) {
+        auto del_rc = ldap_dir->DeleteKrbAttributes(inv_tenant_id, inv_uid);
+        if (!del_rc.ok()) {
+          std::fprintf(stderr, "[gatehouse][ldap] revoke: DeleteKrbAttributes failed for %s/%s: %s\n",
+                       inv_tenant_id.c_str(), inv_uid.c_str(),
+                       del_rc.status().ToString().c_str());
+        }
+      }
+
+      crow::json::wvalue v; v["ok"]=true; return Json(200, v);
+    });
+
+    CROW_ROUTE(app, "/api/admin/user/krb-status").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["has_krb_attrs"]=false; return Json(200, v); }
+
+      const std::string tenant_id = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
+      const std::string uid = req.url_params.get("uid") ? req.url_params.get("uid") : "";
+      if (tenant_id.empty() || uid.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id and uid required"; return Json(400, v); }
+
+      auto has = ldap_dir->HasKrbAttributes(tenant_id, uid);
+      if (!has.ok()) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]=has.status().ToString(); return Json(502, v);
+      }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["has_krb_attrs"] = has.value();
+      return Json(200, v);
+    });
+
+    CROW_ROUTE(app, "/api/admin/user/reset-krb").methods("POST"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto body = crow::json::load(req.body);
+      if (!body || !body.has("tenant_id") || !body.has("uid")) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json (need tenant_id, uid)"; return Json(400, v);
+      }
+      const std::string tenant_id = std::string(body["tenant_id"].s());
+      const std::string uid = std::string(body["uid"].s());
+      if (tenant_id.empty() || uid.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id/uid empty"; return Json(400, v); }
+
+      auto rc = ldap_dir->DeleteKrbAttributes(tenant_id, uid);
+      if (!rc.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] reset-krb failed for %s/%s: %s\n",
+                     tenant_id.c_str(), uid.c_str(), rc.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]=rc.status().ToString(); return Json(502, v);
+      }
+
       crow::json::wvalue v; v["ok"]=true; return Json(200, v);
     });
 
@@ -1349,6 +1601,28 @@ core::Result<void> HttpServer::Run() {
         const std::string uid = std::string(body["uid"].s());
         if (tenant_ou.empty() || uid.empty()) {
           crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_ou/uid empty"; return Json(400, v);
+        }
+        // MED-04: Validate uid and tenant_ou against a strict allowlist to
+        // prevent LDAP-DN-injection or malformed Kerberos principal names.
+        auto is_safe_name = [](const std::string& name) -> bool {
+          if (name.empty() || name.size() > 64) return false;
+          for (char c : name) {
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.')) {
+              return false;
+            }
+          }
+          return true;
+        };
+        if (!is_safe_name(uid)) {
+          crow::json::wvalue v; v["ok"]=false;
+          v["error"]="uid contains invalid characters (allowed: a-z 0-9 - _ .)";
+          return Json(400, v);
+        }
+        if (!is_safe_name(tenant_ou)) {
+          crow::json::wvalue v; v["ok"]=false;
+          v["error"]="tenant_ou contains invalid characters (allowed: a-z 0-9 - _ .)";
+          return Json(400, v);
         }
 
         std::optional<std::string> mail;
@@ -1398,10 +1672,10 @@ core::Result<void> HttpServer::Run() {
         if (!ins.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=ins.status().ToString(); return Json(500, v); }
 
         const std::string invite_url = cfg_.public_base_url + "/invite/accept?token=" + token_hex;
-        const std::string subject = "Gatehouse invitation (" + tenant_ou + ")";
+        const std::string subject = "[" + cfg_.instance_title + "] You have been invited to " + tenant_ou;
         const std::string body_txt =
             "Hello,\n\n"
-            "you have been invited to Gatehouse.\n\n"
+            "you have been invited to " + cfg_.instance_title + ".\n\n"
             "Tenant: " + tenant_ou + "\n"
             "User: " + uid + "\n\n"
             "Accept invitation:\n" + invite_url + "\n\n";
@@ -1434,7 +1708,7 @@ core::Result<void> HttpServer::Run() {
       const std::string csrf = s->csrf_secret_hex;
       std::string html = "<!doctype html><html><head><meta charset='utf-8'>"
                          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                         "<title>Gatehouse – Tenant Overview</title>"
+                         "<title>" + cfg_.instance_title + " – Tenant Overview</title>"
                          "<style>"
                          "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:1100px;background:#f9f9f9;color:#222}"
                          ".card{background:#fff;padding:20px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05);margin-bottom:20px}"
@@ -1704,10 +1978,15 @@ loadTenants();
       return Json(200, v);
     });
 
-        app.bindaddr(cfg_.bind_addr)
-        .port(static_cast<std::uint16_t>(cfg_.port))
-        .concurrency(cfg_.threads)
-        .run();
+        app.concurrency(cfg_.threads);
+
+        if (!cfg_.unix_socket.empty()) {
+          app.local_socket_path(cfg_.unix_socket).run();
+        } else {
+          app.bindaddr(cfg_.bind_addr)
+              .port(static_cast<std::uint16_t>(cfg_.port))
+              .run();
+        }
 
     return core::Result<void>::Ok();
   } catch (...) {

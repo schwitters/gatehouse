@@ -1,5 +1,5 @@
 gatehouse Project Export (Version 500)
-Generated on: Fri Mar  6 07:18:09 AM CET 2026
+Generated on: Wed Mar 11 09:14:02 PM CET 2026
 ==================================================================
 
 vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
@@ -8,7 +8,7 @@ START OF FILE: CMakeLists.txt
 cmake_minimum_required(VERSION 3.24)
 
 project(gatehouse LANGUAGES CXX)
-
+set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -78,6 +78,8 @@ FetchContent_MakeAvailable(crow)
 find_package(SQLite3 REQUIRED)
 
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(COM_ERR REQUIRED com_err)
+pkg_check_modules(KADM5 REQUIRED kadm-client)
 pkg_check_modules(KRB5 REQUIRED krb5)
 pkg_check_modules(LDAP REQUIRED ldap)
 
@@ -107,6 +109,7 @@ add_executable(gatehouse
   src/infra/migrate.cc
   src/infra/session_repo.cc
   src/infra/krb5_client.cc
+  src/infra/kadm5_client.cc
   src/infra/ldap_directory.cc
   src/infra/ticket_vault_read.cc
   src/infra/xrdp_otp_repo.cc
@@ -141,11 +144,18 @@ get_target_property(_sqlite_inc SQLite::SQLite3 INTERFACE_INCLUDE_DIRECTORIES)
 if (_sqlite_inc)
   target_include_directories(gatehouse SYSTEM PRIVATE ${_sqlite_inc})
 endif()
+message(STATUS    "Libraries:  ${COM_ERR_LIBRARIES}")
+message(STATUS    "Includes:   ${COM_ERR_INCLUDE_DIRS}")
 
 # MIT Kerberos (pkg-config)
-target_include_directories(gatehouse SYSTEM PRIVATE ${KRB5_INCLUDE_DIRS})
-target_link_directories(gatehouse PRIVATE ${KRB5_LIBRARY_DIRS})
-target_link_libraries(gatehouse PRIVATE ${KRB5_LIBRARIES})
+target_include_directories(gatehouse SYSTEM PRIVATE ${KRB5_INCLUDE_DIRS} ${KADM5_INCLUDE_DIRS} ${COM_ERR_INCLUDE_DIRS})
+target_link_directories(gatehouse PRIVATE ${KRB5_LIBRARY_DIRS} ${KADM5_LIBRARY_DIRS})
+target_link_libraries(gatehouse PRIVATE 
+   ${KRB5_LIBRARIES} 
+   ${KADM5_LIBRARIES} 
+   /lib/x86_64-linux-gnu/libcom_err.so
+)
+target_link_options(gatehouse PRIVATE -Wl,--no-as-needed -lcom_err)
 target_compile_options(gatehouse PRIVATE ${KRB5_CFLAGS_OTHER})
 
 target_link_libraries(gatehouse PRIVATE OpenSSL::Crypto)
@@ -209,25 +219,9 @@ core::Result<std::optional<LoginPrincipal>> AuthService::Verify(const LoginReque
         core::Status::Error(core::StatusCode::kInvalidArgument, "missing credentials"));
   }
 
-  if (cfg_.mode == AuthMode::kDemo) {
-    if (req.username == "demo" && req.password == "demo") {
-      LoginPrincipal p;
-      p.uid = "demo";
-      p.tenant_id = "default";
-      return core::Result<std::optional<LoginPrincipal>>::Ok(std::optional<LoginPrincipal>(p));
-    }
-    return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
-  }
-
   infra::Krb5Client krb(infra::Krb5Config{.realm = cfg_.krb5_realm});
   auto vr = krb.VerifyPasswordAndGetCcache(req.username, req.password);
   if (!vr.ok()) {
-    if (cfg_.allow_demo_fallback && req.username == "demo" && req.password == "demo") {
-      LoginPrincipal p;
-      p.uid = "demo";
-      p.tenant_id = "default";
-      return core::Result<std::optional<LoginPrincipal>>::Ok(std::optional<LoginPrincipal>(p));
-    }
     return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
   }
 
@@ -506,12 +500,15 @@ START OF FILE: src/app/http_server.cc
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include "app/auth.h"
+#include "infra/krb5_client.h"
 #include "app/email_sender.h"
 #include "core/crypto_aead.h"
 #include "core/hex.h"
@@ -521,6 +518,7 @@ START OF FILE: src/app/http_server.cc
 #include "core/url.h"
 #include "crow.h"
 #include "crow/json.h"
+#include "infra/kadm5_client.h"
 #include "infra/invite_repo.h"
 #include "infra/invite_session_repo.h"
 #include "infra/invite_otp_repo.h"
@@ -558,6 +556,9 @@ crow::response HtmlPage(int code, const std::string& html) {
   crow::response r;
   r.code = code;
   r.set_header("Content-Type", "text/html; charset=utf-8");
+  r.set_header("X-Content-Type-Options", "nosniff");
+  r.set_header("X-Frame-Options", "DENY");
+  r.set_header("Referrer-Policy", "strict-origin-when-cross-origin");
   r.body = html;
   return r;
 }
@@ -573,12 +574,17 @@ crow::response Json(int code, const crow::json::wvalue& v) {
   crow::response r;
   r.code = code;
   r.set_header("Content-Type", "application/json; charset=utf-8");
+  r.set_header("X-Content-Type-Options", "nosniff");
   r.body = v.dump();
   return r;
 }
 
-bool IsAdminUid(const std::vector<std::string>& allow, const std::string& uid) {
-  for (const auto& a : allow) {
+bool IsAdminUid(const HttpServerConfig& cfg, std::optional<infra::LdapDirectory>& ldap, const std::string& uid) {
+  if (!cfg.ldap_admin_group.empty() && ldap.has_value()) {
+    auto rc = ldap->IsUserInGroup(uid, cfg.ldap_admin_group);
+    if (rc.ok() && rc.value()) return true;
+  }
+  for (const auto& a : cfg.admin_uids) {
     if (a == uid) return true;
   }
   return false;
@@ -660,7 +666,6 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
 </style></head>
 <body>
 <h1>Gatehouse</h1>
-<p class="hint">Temporary demo login: <code>demo</code> / <code>demo</code></p>
 <form method="post" action="/auth/login">
   <label>Username <input name="username" autocomplete="username" required></label>
   <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
@@ -717,6 +722,20 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Uninvited LDAP Users</h2>
+    <div class="row">
+      <div>
+        <label>Target Tenant OU
+          <input id="uninvTenant" placeholder="k8s-20260118">
+        </label>
+      </div>
+    </div>
+    <button id="btnSearchUninvited">Find Users</button>
+    <p id="statusUninvited"></p>
+    <div id="uninvitedList"></div>
+  </div>
+
+  <div class="card">
     <h2>Latest invites</h2>
     <div class="row">
       <div>
@@ -736,8 +755,13 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
   </div>
 
 <script>
+function getCsrfToken() {
+  const m = document.cookie.match(/(?:^|;\s*)gh_csrf=([^;]+)/);
+  return m ? m[1] : '';
+}
+
 async function apiJson(method, path, body) {
-  const opt = {method, headers: {"Content-Type":"application/json"}};
+  const opt = {method, headers: {"Content-Type":"application/json", "X-CSRF-Token": getCsrfToken()}};
   if (body !== undefined) opt.body = JSON.stringify(body);
   const r = await fetch(path, opt);
   const t = await r.text();
@@ -778,36 +802,60 @@ function renderList(items) {
   }
   const table = document.createElement("table");
   const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>created</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>expires</th><th>actions</th></tr>";
+  thead.innerHTML = "<tr><th>created / dates</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>actions</th></tr>";
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
   for (const it of items) {
     const tr = document.createElement("tr");
+    
+    // Dates formatting
     const created = new Date(it.created_at * 1000).toLocaleString();
     const expires = new Date(it.expires_at * 1000).toLocaleString();
+    let datesHtml = "<div>" + created + "</div><div style='color:#555;font-size:0.85em;margin-top:4px'>Expires: " + expires + "</div>";
+    
+    if (it.consumed_at && it.consumed_at > 0) {
+        datesHtml += "<div style='color:#0a7a2f;font-size:0.85em'>Completed: " + new Date(it.consumed_at * 1000).toLocaleString() + "</div>";
+    }
+    if (it.revoked_at && it.revoked_at > 0) {
+        datesHtml += "<div style='color:#b00020;font-size:0.85em'>Revoked: " + new Date(it.revoked_at * 1000).toLocaleString() + "</div>";
+    }
+
+    // Pill color logic based on status string
+    let pillColor = "#f4f4f4";
+    let textColor = "#000";
+    if (it.status_name === "Completed") { pillColor = "#e6f4ea"; textColor = "#137333"; }
+    else if (it.status_name === "Revoked" || it.status_name === "Expired") { pillColor = "#fce8e6"; textColor = "#c5221f"; }
+    else if (it.status_name === "StepupVerified") { pillColor = "#e8f0fe"; textColor = "#1a73e8"; }
+
     tr.innerHTML =
-      "<td>" + created + "</td>" +
+      "<td>" + datesHtml + "</td>" +
       "<td><code>" + it.tenant_id + "</code></td>" +
       "<td><code>" + (it.invited_uid||"") + "</code></td>" +
       "<td>" + it.invited_email + "</td>" +
-      "<td><span class='pill'>" + it.status_name + "</span></td>" +
-      "<td>" + expires + "</td>" +
+      "<td><span class='pill' style='background:" + pillColor + ";color:" + textColor + ";font-weight:500'>" + it.status_name + "</span></td>" +
       "<td></td>";
-    const td = tr.querySelectorAll("td")[6];
+    const td = tr.querySelectorAll("td")[5];
 
-    const btnRevoke = document.createElement("button");
-    btnRevoke.textContent = "Revoke";
-    btnRevoke.style.marginRight = "8px";
-    btnRevoke.onclick = async () => {
-      const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
-      if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
-      await refresh();
-    };
-    td.appendChild(btnRevoke);
+    // Status codes: 4=Completed, 5=Expired, 6=Revoked
+    const canRevoke = it.status !== 4 && it.status !== 5 && it.status !== 6;
+    
+    if (canRevoke) {
+      const btnRevoke = document.createElement("button");
+      btnRevoke.textContent = "Revoke";
+      btnRevoke.style.marginRight = "8px";
+      btnRevoke.onclick = async () => {
+        if (!confirm("Are you sure you want to revoke this invitation for " + it.invited_email + "?")) return;
+        const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
+        if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
+        await refresh();
+      };
+      td.appendChild(btnRevoke);
+    }
 
     const btnResend = document.createElement("button");
-    btnResend.textContent = "Resend (new invite)";
+    btnResend.textContent = "Resend";
     btnResend.onclick = async () => {
+      if (!confirm("Generate a new invite link for " + it.invited_email + "?")) return;
       const r = await apiJson("POST", "/api/admin/invites", {tenant_ou: it.tenant_id, uid: it.invited_uid});
       if (!r.ok) { alert("Resend failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
       renderJson("outCreate", r.json || {});
@@ -838,6 +886,54 @@ async function refresh() {
   setStatus("statusList", "ok", "Loaded " + (j.items ? j.items.length : 0) + " invite(s).");
   renderList(j.items || []);
 }
+
+async function searchUninvited() {
+  setStatus("statusUninvited", "", "Searching LDAP...");
+  const t = document.getElementById("uninvTenant").value.trim();
+  if (!t) { setStatus("statusUninvited", "err", "Please enter a Tenant OU."); return; }
+  
+  const r = await fetch("/api/admin/uninvited?tenant_id=" + encodeURIComponent(t));
+  const j = await r.json().catch(() => null);
+  if (!r.ok) { setStatus("statusUninvited", "err", "Error: " + (j && j.error ? j.error : r.status)); return; }
+  
+  const items = j.items || [];
+  setStatus("statusUninvited", "ok", "Found " + items.length + " uninvited user(s).");
+  
+  const root = document.getElementById("uninvitedList");
+  root.innerHTML = "";
+  if (items.length === 0) return;
+  
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>uid</th><th>email</th><th>actions</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td><code>" + it.uid + "</code></td><td>" + it.mail + "</td><td></td>";
+    const td = tr.querySelectorAll("td")[2];
+    
+    const btn = document.createElement("button");
+    btn.textContent = "Send Invite";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Sending...";
+      const res = await apiJson("POST", "/api/admin/invites", {tenant_ou: t, uid: it.uid});
+      if (!res.ok) {
+        alert("Failed: " + (res.json && res.json.error ? res.json.error : res.text));
+        btn.disabled = false;
+        btn.textContent = "Send Invite";
+      } else {
+        btn.textContent = "Sent!";
+        await refresh(); // refresh the invites list below
+      }
+    };
+    td.appendChild(btn);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+document.getElementById("btnSearchUninvited").addEventListener("click", searchUninvited);
 
 document.getElementById("btnCreate").addEventListener("click", async () => {
   const tenant_ou = document.getElementById("tenant_ou").value.trim();
@@ -917,6 +1013,30 @@ core::Result<void> HttpServer::Run() {
       (void)invite_sessions.DeleteExpired(core::UnixNow());
     };
 
+    // Login rate limiting: max 10 attempts per IP per 5 minutes.
+    std::mutex login_rl_mutex;
+    std::unordered_map<std::string, std::pair<int, std::int64_t>> login_attempts;
+    constexpr int kLoginMaxAttempts = 10;
+    constexpr std::int64_t kLoginWindowSecs = 300;
+    auto check_login_rate_limit = [&](const std::string& ip) -> bool {
+      std::lock_guard<std::mutex> lk(login_rl_mutex);
+      auto& entry = login_attempts[ip];
+      const std::int64_t now_ts = core::UnixNow();
+      if (now_ts - entry.second > kLoginWindowSecs) {
+        entry = {0, now_ts};
+      }
+      entry.first++;
+      return entry.first <= kLoginMaxAttempts;
+    };
+
+    // Compute SHA256 of a remote IP string for session binding.
+    auto hash_remote_ip = [](const std::string& ip) -> std::vector<std::uint8_t> {
+      if (ip.empty()) return {};
+      const std::vector<std::uint8_t> ip_bytes(ip.begin(), ip.end());
+      auto h = core::Sha256(ip_bytes);
+      return h.ok() ? h.value() : std::vector<std::uint8_t>{};
+    };
+
     auto require_auth = [&](const crow::request& req) -> std::optional<infra::SessionRow> {
       gc_sessions();
       const std::string sid = CookieValueFromHeader(req, cfg_.session_cookie_name);
@@ -925,6 +1045,16 @@ core::Result<void> HttpServer::Run() {
       if (!got.ok() || !got.value().has_value()) return std::nullopt;
       const infra::SessionRow& row = *got.value();
       if (row.expires_at <= core::UnixNow()) return std::nullopt;
+      // IP binding: validate that the request comes from the same IP as the login.
+      if (!row.ip_hash_hex.empty()) {
+        const std::vector<std::uint8_t> req_ip_hash = hash_remote_ip(req.remote_ip_address);
+        if (req_ip_hash.empty() ||
+            core::HexEncode(req_ip_hash) != row.ip_hash_hex) {
+          std::fprintf(stderr, "[gatehouse][security] Session IP mismatch for uid=%s\n",
+                       row.uid.c_str());
+          return std::nullopt;
+        }
+      }
       return row;
     };
 
@@ -938,6 +1068,26 @@ core::Result<void> HttpServer::Run() {
       if (row.expires_at <= core::UnixNow()) return std::nullopt;
       if (row.consumed_at != 0) return std::nullopt;
       return row;
+    };
+
+    // CSRF validation helpers.
+    // Form-POSTs: check hidden field "_csrf" in the urlencoded body.
+    // JSON-API-POSTs: check "X-CSRF-Token" request header.
+    auto csrf_ok_form = [](const crow::request& req, const infra::SessionRow& s) -> bool {
+      auto tok = core::FormGet(req.body, "_csrf");
+      return tok.has_value() && !tok->empty() && *tok == s.csrf_secret_hex;
+    };
+    auto csrf_ok_header = [](const crow::request& req, const infra::SessionRow& s) -> bool {
+      const std::string tok = req.get_header_value("X-CSRF-Token");
+      return !tok.empty() && tok == s.csrf_secret_hex;
+    };
+
+    // Sets the gh_csrf readable cookie (no HttpOnly so JS can read it for XHR requests).
+    auto set_csrf_cookie = [&](crow::response& r, const std::string& csrf_hex,
+                               std::int64_t max_age) {
+      r.add_header("Set-Cookie",
+                   "gh_csrf=" + csrf_hex + "; Path=/; Max-Age=" +
+                       std::to_string(max_age) + "; SameSite=Strict");
     };
 
     // ---- health ----
@@ -964,14 +1114,24 @@ core::Result<void> HttpServer::Run() {
     });
 
     CROW_ROUTE(app, "/auth/logout").methods("POST"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (s.has_value() && !csrf_ok_form(req, *s)) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
       const std::string sid = CookieValueFromHeader(req, cfg_.session_cookie_name);
       if (!sid.empty()) (void)sessions.DeleteBySid(sid);
       auto r = RedirectTo("/login");
-      r.add_header("Set-Cookie", cfg_.session_cookie_name + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+      r.add_header("Set-Cookie",
+                   cfg_.session_cookie_name + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+      r.add_header("Set-Cookie", "gh_csrf=deleted; Path=/; Max-Age=0; SameSite=Strict");
       return r;
     });
 
     CROW_ROUTE(app, "/auth/login").methods("POST"_method)([&](const crow::request& req) {
+      if (!check_login_rate_limit(req.remote_ip_address)) {
+        return RedirectTo("/login?err=Too+many+login+attempts.+Please+try+again+in+5+minutes.");
+      }
+
       const std::optional<std::string> u = core::FormGet(req.body, "username");
       const std::optional<std::string> p = core::FormGet(req.body, "password");
 
@@ -982,7 +1142,13 @@ core::Result<void> HttpServer::Run() {
       auto vr = auth.Verify(lr);
       if (!vr.ok() || !vr.value().has_value()) return RedirectTo("/login?err=Invalid+credentials");
 
-      const LoginPrincipal& principal = *vr.value();
+      LoginPrincipal principal = *vr.value();
+      if (ldap_dir.has_value()) {
+        auto t_res = ldap_dir->ResolveTenantByUid(principal.uid);
+        if (t_res.ok() && t_res.value().has_value()) {
+          principal.tenant_id = t_res.value().value();
+        }
+      }
       auto ticket_id = StoreTicketIfPresent(vault, master_key, principal);
       if (!ticket_id.ok()) return RedirectTo("/login?err=Internal+error");
 
@@ -999,7 +1165,8 @@ core::Result<void> HttpServer::Run() {
       row.mfa_state = 0;
       row.ticket_id = ticket_id.value();
 
-      auto ins = sessions.Insert(row, csrf_bytes.value());
+      const std::vector<std::uint8_t> ip_hash = hash_remote_ip(req.remote_ip_address);
+      auto ins = sessions.Insert(row, csrf_bytes.value(), ip_hash);
       if (!ins.ok()) return RedirectTo("/login?err=Internal+error");
 
       auto r = RedirectTo("/portal");
@@ -1007,6 +1174,7 @@ core::Result<void> HttpServer::Run() {
                    cfg_.session_cookie_name + "=" + row.sid +
                        "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
                        "; HttpOnly; SameSite=Lax");
+      set_csrf_cookie(r, core::HexEncode(csrf_bytes.value()), cfg_.session_ttl_seconds);
       return r;
     });
 
@@ -1015,23 +1183,126 @@ core::Result<void> HttpServer::Run() {
       auto s = require_auth(req);
       if (!s.has_value()) return RedirectTo("/login");
 
-      const bool is_admin = IsAdminUid(cfg_.admin_uids, s->uid);
+      const bool is_admin = IsAdminUid(cfg_, ldap_dir, s->uid);
       std::string admin_block;
       if (is_admin) {
-        admin_block = "<p><b>Admin</b>: <a href=\"/admin/invites\">Create & manage invitations</a></p>";
+        admin_block = "<p><b>Admin</b>: ";
+        admin_block += "<a href=\"/admin/invites\">Invitations</a>";
+        admin_block += " &nbsp;|&nbsp; ";
+        admin_block += "<a href=\"/admin/tenants\">Tenant &amp; User Overview</a>";
+        admin_block += "</p>";
       }
 
-      const std::string html =
-          "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-          "<title>Gatehouse</title></head>"
-          "<body style=\"font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px\">"
-          "<h1>Gatehouse Portal</h1>"
-          "<p>Signed in as <b>" + crow::json::escape(s->uid) + "</b></p>"
-          "<p>Tenant: <b>" + crow::json::escape(s->tenant_id) + "</b></p>" +
-          admin_block +
-          "<form method=\"post\" action=\"/auth/logout\"><button type=\"submit\" style=\"padding:10px 14px\">Logout</button></form>"
-          "</body></html>";
+            std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+      html += "<title>Gatehouse Portal</title>";
+      html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px;background:#f9f9f9;color:#222}";
+      html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:24px}";
+      html += "h1{margin-top:0} .host-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-top:16px}";
+      html += ".host-card{padding:16px;border:1px solid #e0e0e0;border-radius:8px;background:#fafafa}";
+      html += ".host-card b{display:block;font-size:1.1em;color:#0b57d0} .host-card code{font-size:0.9em;color:#555;background:#eee;padding:2px 6px;border-radius:4px}";
+      html += "button{padding:10px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600}";
+      html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:600} a:hover{text-decoration:underline}";
+      html += "</style></head><body>";
+      html += "<h1>Gatehouse Portal</h1>";
+      
+      // Card: User Info
+      html += "<div class=\"card\"><h3>Identity</h3>";
+      html += "<p>Signed in as <b>" + crow::json::escape(s->uid) + "</b><br>";
+      html += "Tenant: <code>" + crow::json::escape(s->tenant_id) + "</code></p>";
+      if (!admin_block.empty()) html += admin_block;
+      html += "</div>";
+
+      // Card: Hosts (populated via JS)
+      html += "<div class=\"card\"><h3>My Infrastructure</h3>";
+      html += "<div id=\"hostContainer\"><p style=\"color:#666\">Loading hosts...</p></div>";
+      html += "</div>";
+
+      // Card: Security
+      html += "<div class=\"card\"><h3>Security</h3>";
+      html += "<p style=\"color:#555\">Manage your Kerberos account credentials.</p>";
+      html += "<a href=\"/portal/changepw\" style=\"display:inline-block;padding:10px 16px;background:#0b57d0;color:#fff;text-decoration:none;border-radius:6px;font-weight:600\">Change Password</a>";
+      html += "</div>";
+
+      // Card: Logout (CSRF token embedded)
+      html += "<form method=\"post\" action=\"/auth/logout\">";
+      html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
+      html += "<button type=\"submit\">Logout</button></form>";
+
+      // JavaScript to fetch and render hosts
+      html += "<script>";
+      html += "async function loadHosts() {";
+      html += "  const r = await fetch('/api/me/hosts');";
+      html += "  const div = document.getElementById('hostContainer');";
+      html += "  if (!r.ok) { div.innerHTML = '<p style=\"color:#b00020\">Failed to load hosts.</p>'; return; }";
+      html += "  const j = await r.json();";
+      html += "  if (!j.items || j.items.length === 0) { div.innerHTML = '<p>No managed hosts assigned to you.</p>'; return; }";
+      html += "  let h = '<div class=\"host-grid\">';";
+      html += "  for(const host of j.items) {";
+      html += "    h += '<div class=\"host-card\">';";
+      html += "    h += '<b>' + (host.hostname || 'Unknown Host') + '</b>';";
+      html += "    h += '<p style=\"margin:8px 0 0 0\"><code>' + (host.ip || 'No IP configured') + '</code></p>';";
+      html += "    h += '</div>';";
+      html += "  }";
+      html += "  h += '</div>';";
+      html += "  div.innerHTML = h;";
+      html += "}";
+      html += "loadHosts();";
+      html += "</script>";
+
+      html += "</body></html>";
       return HtmlPage(200, html);
+    });
+
+    // ---- GET & POST /portal/changepw ----
+    CROW_ROUTE(app, "/portal/changepw").methods("GET"_method, "POST"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) return RedirectTo("/login");
+
+      if (req.method == "GET"_method) {
+        const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
+        std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+        html += "<title>Change Password - Gatehouse</title>";
+        html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:540px;background:#f9f9f9;color:#222}";
+        html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}";
+        html += "label{display:block;margin-top:16px;font-weight:500;font-size:0.95em} input{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}";
+        html += "button{margin-top:24px;padding:12px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600;width:100%;font-size:1em}";
+        html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:500} a:hover{text-decoration:underline}";
+        html += "</style></head><body>";
+        html += "<p><a href=\"/portal\">&larr; Back to Dashboard</a></p>";
+        html += "<h1>Change Password</h1>";
+        html += "<div class=\"card\">";
+        if (!err.empty()) html += "<div style=\"color:#b00020;background:#fce8e6;padding:12px;border-radius:8px;margin-bottom:16px\"><b>Error:</b> " + crow::json::escape(err) + "</div>";
+        html += "<form method=\"post\" action=\"/portal/changepw\">";
+        html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
+        html += "<label>Old Password <input type=\"password\" name=\"old_password\" required autofocus></label>";
+        html += "<label>New Password <input type=\"password\" name=\"new_password\" required minlength=\"8\"></label>";
+        html += "<label>Confirm New Password <input type=\"password\" name=\"new_password_confirm\" required minlength=\"8\"></label>";
+        html += "<button type=\"submit\">Update Password</button>";
+        html += "</form></div></body></html>";
+        return HtmlPage(200, html);
+      } else {
+        // --- POST Logic ---
+        if (!csrf_ok_form(req, *s)) return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+
+        const std::string old_pw = core::FormGet(req.body, "old_password").value_or("");
+        const std::string new_pw = core::FormGet(req.body, "new_password").value_or("");
+        const std::string conf_pw = core::FormGet(req.body, "new_password_confirm").value_or("");
+
+        if (old_pw.empty() || new_pw.empty()) return RedirectTo("/portal/changepw?err=Missing+password+fields");
+        if (new_pw != conf_pw) return RedirectTo("/portal/changepw?err=New+passwords+do+not+match");
+
+        infra::Krb5Client krb(infra::Krb5Config{.realm = cfg_.auth_cfg.krb5_realm});
+        auto rc = krb.ChangePassword(s->uid, old_pw, new_pw);
+        
+        if (!rc.ok()) {
+          std::fprintf(stderr, "[gatehouse][changepw] KDC error for %s: %s\n",
+                       s->uid.c_str(), rc.status().ToString().c_str());
+          return RedirectTo("/portal/changepw?err=Password+change+failed."
+                            "+Check+your+old+password+and+ensure+the+new+password+meets+policy.");
+        }
+
+        return RedirectTo("/portal?ok=Password+successfully+changed");
+      }
     });
 
     CROW_ROUTE(app, "/").methods("GET"_method)([&](const crow::request& req) {
@@ -1044,7 +1315,7 @@ core::Result<void> HttpServer::Run() {
     CROW_ROUTE(app, "/admin/invites").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) return RedirectTo("/login");
-      if (!IsAdminUid(cfg_.admin_uids, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
       return HtmlPage(200, kAdminInvitesPage);
     });
 
@@ -1060,19 +1331,41 @@ core::Result<void> HttpServer::Run() {
       auto hash = core::Sha256(token_bytes.value());
       if (!hash.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
+      // BEGIN IMMEDIATE transaction to prevent race condition: two concurrent requests
+      // with the same token must not both create valid invite sessions.
+      auto tx = db_->Exec("BEGIN IMMEDIATE;");
+      if (!tx.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
       auto row = invites.GetByTokenHash(hash.value());
-      if (!row.ok() || !row.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+      if (!row.ok() || !row.value().has_value()) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(404, "<h1>Invitation not found</h1>");
+      }
 
       const auto now = core::UnixNow();
       const auto& inv = *row.value();
 
-      if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) return HtmlPage(410, "<h1>Invitation revoked</h1>");
-      if (inv.expires_at <= now) return HtmlPage(410, "<h1>Invitation expired</h1>");
+      if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(410, "<h1>Invitation revoked</h1>");
+      }
+      if (inv.status == infra::InviteStatus::kCompleted) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(410, "<h1>Invitation already completed</h1>");
+      }
+      if (inv.expires_at <= now) {
+        (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kExpired, now);
+        (void)db_->Exec("COMMIT;");
+        return HtmlPage(410, "<h1>Invitation expired</h1>");
+      }
 
       (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kLinkVerified, now);
 
       auto sid_bytes = core::RandomBytes(32);
-      if (!sid_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (!sid_bytes.ok()) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(500, "<h1>Internal error</h1>");
+      }
 
       infra::InviteSessionRow s;
       s.sid = core::HexEncode(sid_bytes.value());
@@ -1081,7 +1374,13 @@ core::Result<void> HttpServer::Run() {
       s.expires_at = now + 1800;
 
       auto ins = invite_sessions.Insert(s);
-      if (!ins.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (!ins.ok()) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(500, "<h1>Internal error</h1>");
+      }
+
+      auto cm = db_->Exec("COMMIT;");
+      if (!cm.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
       auto r = RedirectTo("/invite/complete");
       r.add_header("Set-Cookie", std::string(kInviteCookie) + "=" + s.sid +
@@ -1105,7 +1404,8 @@ core::Result<void> HttpServer::Run() {
       std::string display;
       if (prof.ok() && prof.value().has_value()) display = prof.value()->display_name;
 
-      const bool verified = invite_otps.IsVerified(is->sid).ok() ? invite_otps.IsVerified(is->sid).value() : false;
+      auto verified_res = invite_otps.IsVerified(is->sid);
+      const bool verified = verified_res.ok() && verified_res.value();
 
       const std::string sent = req.url_params.get("sent") ? req.url_params.get("sent") : "";
       const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
@@ -1131,16 +1431,25 @@ core::Result<void> HttpServer::Run() {
       html += "<p class='muted'>Email: <b>" + crow::json::escape(row.invited_email) + "</b></p>";
       html += msg;
 
+      // Use the invite session SID as CSRF token: it is HttpOnly so external JS cannot
+      // read it, but the server embeds it in HTML and validates it on every POST.
+      const std::string inv_csrf = crow::json::escape(is->sid);
       if (!verified) {
         html += "<h3>Verify email</h3>";
-        html += "<form method='post' action='/invite/otp/send'><button type='submit'>Send code</button></form>";
+        html += "<form method='post' action='/invite/otp/send'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
+        html += "<button type='submit'>Send code</button></form>";
         html += "<form method='post' action='/invite/otp/verify'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
         html += "<label>Code<input name='code' placeholder='123456' autocomplete='one-time-code'></label>";
         html += "<button type='submit'>Verify</button></form>";
       } else {
         html += "<h3>Profile</h3>";
         html += "<form method='post' action='/invite/complete'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
         html += "<label>Display name (optional)<input name='display_name' value='" + crow::json::escape(display) + "'></label>";
+        html += "<label>New Password<input type='password' name='password' required minlength='8'></label>";
+        html += "<label>Confirm Password<input type='password' name='password_confirm' required minlength='8'></label>";
         html += "<button type='submit'>Finish</button></form>";
       }
 
@@ -1152,12 +1461,45 @@ core::Result<void> HttpServer::Run() {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
 
+      const auto csrf_val = core::FormGet(req.body, "_csrf");
+      if (!csrf_val.has_value() || *csrf_val != is->sid) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
+
       auto inv = invites.GetById(is->invite_id);
       if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
 
       const auto now = core::UnixNow();
       const std::optional<std::string> dn = core::FormGet(req.body, "display_name");
       const std::string display = dn.value_or("");
+      
+      const std::string pwd1 = core::FormGet(req.body, "password").value_or("");
+      const std::string pwd2 = core::FormGet(req.body, "password_confirm").value_or("");
+      
+      if (pwd1.empty() || pwd1 != pwd2) {
+        return RedirectTo("/invite/complete?err=Passwords+do+not+match");
+      }
+
+      const char* env_kadmin_princ = std::getenv("GATEHOUSE_KADM5_ADMIN_PRINC");
+      const char* env_kadmin_pass = std::getenv("GATEHOUSE_KADM5_ADMIN_PASS");
+      
+      if (env_kadmin_princ && env_kadmin_pass && ldap_dir.has_value()) {
+        infra::Kadm5Config kcfg;
+        kcfg.realm = cfg_.auth_cfg.krb5_realm;
+        kcfg.admin_principal = env_kadmin_princ;
+        kcfg.admin_password = env_kadmin_pass;
+        infra::Kadm5Client kadm(kcfg);
+
+        auto dn_res = ldap_dir->GetUserDn(inv.value()->tenant_id, inv.value()->invited_uid);
+        if (dn_res.ok() && dn_res.value().has_value()) {
+           std::string new_princ = inv.value()->invited_uid + "@" + cfg_.auth_cfg.krb5_realm;
+           auto krc = kadm.CreatePrincipal(new_princ, pwd1, dn_res.value().value());
+           if (!krc.ok()) {
+               std::fprintf(stderr, "[gatehouse][kadm5] Failed to create principal: %s\n", krc.status().ToString().c_str());
+               return RedirectTo("/invite/complete?err=Failed+to+create+Kerberos+principal");
+           }
+        }
+      }
 
       infra::InviteProfileRow pr;
       pr.invite_id = is->invite_id;
@@ -1169,16 +1511,44 @@ core::Result<void> HttpServer::Run() {
       (void)invites.UpdateStatus(is->invite_id, infra::InviteStatus::kCompleted, now);
       (void)invite_sessions.Consume(is->sid, now);
 
+      // --- P3: Activate User in LDAP ---
+      if (ldap_dir.has_value() && inv.value()->invited_uid != "") {
+        auto act_rc = ldap_dir->ActivateUser(inv.value()->tenant_id, inv.value()->invited_uid);
+        if (!act_rc.ok()) {
+          std::fprintf(stderr, "[gatehouse][activate] Warning: LDAP activation failed for %s: %s\n", 
+                       inv.value()->invited_uid.c_str(), act_rc.status().ToString().c_str());
+          // Optional: You could redirect to an error page here if LDAP unlock is strictly required.
+          // For now, we log the warning and let the user complete the flow.
+        }
+      }
+      // ---------------------------------
+
       auto r = HtmlPage(200, "<h1>Done</h1><p>Your invitation is completed.</p><p><a href=\"/login\">Login</a></p>");
       r.add_header("Set-Cookie", std::string(kInviteCookie) + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
       return r;
     });
 
-    
     // ---- invite OTP step-up (email) ----
     CROW_ROUTE(app, "/invite/otp/send").methods("POST"_method)([&](const crow::request& req) {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      const auto csrf_val = core::FormGet(req.body, "_csrf");
+      if (!csrf_val.has_value() || *csrf_val != is->sid) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
+
+      const std::int64_t now = core::UnixNow();
+
+      // Cooldown check (Rate Limiting)
+      auto last_issued = invite_otps.GetLastIssuedAt(is->sid);
+      if (!last_issued.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (last_issued.value().has_value()) {
+        const std::int64_t diff = now - last_issued.value().value();
+        if (diff < 60) {
+          return RedirectTo("/invite/complete?err=Please+wait+60+seconds+before+requesting+a+new+code");
+        }
+      }
 
       auto inv = invites.GetById(is->invite_id);
       if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
@@ -1205,7 +1575,6 @@ core::Result<void> HttpServer::Run() {
       auto otp_id_bytes = core::RandomBytes(16);
       if (!otp_id_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
-      const std::int64_t now = core::UnixNow();
       infra::InviteOtpRow o;
       o.otp_id = core::HexEncode(otp_id_bytes.value());
       o.sid = is->sid;
@@ -1226,12 +1595,18 @@ core::Result<void> HttpServer::Run() {
       auto mail_rc = email->SendText(row.invited_email, subject, body_txt);
       if (!mail_rc.ok()) return HtmlPage(502, "<h1>Mail send failed</h1>");
 
+      (void)invites.UpdateStatus(row.invite_id, infra::InviteStatus::kStepupSent, now);
       return RedirectTo("/invite/complete?sent=1");
     });
 
     CROW_ROUTE(app, "/invite/otp/verify").methods("POST"_method)([&](const crow::request& req) {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      const auto csrf_val = core::FormGet(req.body, "_csrf");
+      if (!csrf_val.has_value() || *csrf_val != is->sid) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
 
       const std::optional<std::string> c = core::FormGet(req.body, "code");
       const std::string code = c.value_or("");
@@ -1246,10 +1621,38 @@ core::Result<void> HttpServer::Run() {
       if (!ok.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
       if (!ok.value()) return RedirectTo("/invite/complete?err=wrong+code");
 
+      // Mark step-up as verified in the invite status.
+      auto inv_otp = invites.GetById(is->invite_id);
+      if (inv_otp.ok() && inv_otp.value().has_value()) {
+        (void)invites.UpdateStatus(is->invite_id, infra::InviteStatus::kStepupVerified, now);
+      }
       return RedirectTo("/invite/complete?ok=1");
     });
 
-// ---- JSON auth + me ----
+    // ---- API: My Hosts ----
+    CROW_ROUTE(app, "/api/me/hosts").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto hr = ldap_dir->GetUserHosts(s->tenant_id, s->uid);
+      if (!hr.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=hr.status().ToString(); return Json(502, v); }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["items"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& h : hr.value()) {
+        crow::json::wvalue it;
+        it["hostname"] = h.hostname;
+        it["ip"] = h.ip;
+        it["dn"] = h.dn;
+        v["items"][idx++] = std::move(it);
+      }
+      return Json(200, v);
+    });
+
+    // ---- JSON auth + me ----
     CROW_ROUTE(app, "/api/me").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) {
@@ -1267,6 +1670,10 @@ core::Result<void> HttpServer::Run() {
     });
 
     CROW_ROUTE(app, "/api/auth/login").methods("POST"_method)([&](const crow::request& req) {
+      if (!check_login_rate_limit(req.remote_ip_address)) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]="too many login attempts"; return Json(429, v);
+      }
+
       auto body = crow::json::load(req.body);
       if (!body) {
         crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json"; return Json(400, v);
@@ -1281,7 +1688,13 @@ core::Result<void> HttpServer::Run() {
         crow::json::wvalue v; v["ok"]=false; v["error"]="invalid credentials"; return Json(401, v);
       }
 
-      const LoginPrincipal& principal = *vr.value();
+      LoginPrincipal principal = *vr.value();
+      if (ldap_dir.has_value()) {
+        auto t_res = ldap_dir->ResolveTenantByUid(principal.uid);
+        if (t_res.ok() && t_res.value().has_value()) {
+          principal.tenant_id = t_res.value().value();
+        }
+      }
       auto ticket_id = StoreTicketIfPresent(vault, master_key, principal);
       if (!ticket_id.ok()) {
         crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
@@ -1302,7 +1715,8 @@ core::Result<void> HttpServer::Run() {
       row.mfa_state = 0;
       row.ticket_id = ticket_id.value();
 
-      auto ins = sessions.Insert(row, csrf_bytes.value());
+      const std::vector<std::uint8_t> ip_hash_api = hash_remote_ip(req.remote_ip_address);
+      auto ins = sessions.Insert(row, csrf_bytes.value(), ip_hash_api);
       if (!ins.ok()) {
         crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
       }
@@ -1318,14 +1732,58 @@ core::Result<void> HttpServer::Run() {
                       cfg_.session_cookie_name + "=" + row.sid +
                           "; Path=/; Max-Age=" + std::to_string(cfg_.session_ttl_seconds) +
                           "; HttpOnly; SameSite=Lax");
+      set_csrf_cookie(resp, core::HexEncode(csrf_bytes.value()), cfg_.session_ttl_seconds);
       return resp;
     });
 
     // ---- Admin APIs ----
+
+    // ---- API: List uninvited users ----
+    CROW_ROUTE(app, "/api/admin/uninvited").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+
+      const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
+      if (tenant.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id required"; return Json(400, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto ldap_res = ldap_dir->ListUsers(tenant);
+      if (!ldap_res.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] ListUsers failed for %s: %s\n",
+                     tenant.c_str(), ldap_res.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
+
+      auto inv_res = invites.GetInvitedUids(tenant, core::UnixNow());
+      if (!inv_res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=inv_res.status().ToString(); return Json(500, v); }
+
+      // Compute difference
+      std::vector<std::string> invited = inv_res.value();
+      auto is_invited = [&](const std::string& u) {
+          for(const auto& x : invited) if(x == u) return true;
+          return false;
+      };
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["items"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& u : ldap_res.value()) {
+          if (!is_invited(u.uid)) {
+              crow::json::wvalue it;
+              it["uid"] = u.uid;
+              it["mail"] = u.mail;
+              v["items"][idx++] = std::move(it);
+          }
+      }
+      return Json(200, v);
+    });
+
     CROW_ROUTE(app, "/api/admin/invites/list").methods("GET"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
-      if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
       const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
       const std::string uid = req.url_params.get("invited_uid") ? req.url_params.get("invited_uid") : "";
@@ -1349,6 +1807,7 @@ core::Result<void> HttpServer::Run() {
         it["created_at"] = r.created_at;
         it["expires_at"] = r.expires_at;
         it["revoked_at"] = r.revoked_at;
+        it["consumed_at"] = r.consumed_at;
         it["created_by"] = r.created_by;
         v["items"][idx++] = std::move(it);
       }
@@ -1358,7 +1817,8 @@ core::Result<void> HttpServer::Run() {
     CROW_ROUTE(app, "/api/admin/invites/revoke").methods("POST"_method)([&](const crow::request& req) {
       auto s = require_auth(req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
-      if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
       auto body = crow::json::load(req.body);
       if (!body || !body.has("invite_id")) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json (need invite_id)"; return Json(400, v); }
@@ -1374,7 +1834,8 @@ core::Result<void> HttpServer::Run() {
       try {
         auto s = require_auth(req);
         if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
-        if (!IsAdminUid(cfg_.admin_uids, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+        if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+        if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
 
         auto body = crow::json::load(req.body);
         if (!body || !body.has("tenant_ou") || !body.has("uid")) {
@@ -1389,7 +1850,11 @@ core::Result<void> HttpServer::Run() {
         std::optional<std::string> mail;
         if (ldap_dir.has_value()) {
           auto rc = ldap_dir->LookupMail(tenant_ou, uid);
-          if (!rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=rc.status().ToString(); return Json(502, v); }
+          if (!rc.ok()) {
+            std::fprintf(stderr, "[gatehouse][ldap] LookupMail failed for %s/%s: %s\n",
+                         tenant_ou.c_str(), uid.c_str(), rc.status().ToString().c_str());
+            crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+          }
           mail = rc.value();
         } else if (!cfg_.ldif_path.empty()) {
           mail = ldif_dir.LookupMail(tenant_ou, uid);
@@ -1400,6 +1865,9 @@ core::Result<void> HttpServer::Run() {
         if (!mail.has_value() || mail->empty()) {
           crow::json::wvalue v; v["ok"]=false; v["error"]="user not found or missing mail"; return Json(404, v);
         }
+
+        // Revoke any existing pending invites for the same tenant+uid before creating a new one.
+        (void)invites.RevokePending(tenant_ou, uid, core::UnixNow());
 
         auto token_bytes = core::RandomBytes(32);
         auto invite_id_bytes = core::RandomBytes(16);
@@ -1452,7 +1920,287 @@ core::Result<void> HttpServer::Run() {
       }
     });
 
-    app.bindaddr(cfg_.bind_addr)
+    // ---- Admin: Tenant & User Overview ----
+
+    CROW_ROUTE(app, "/admin/tenants").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) return RedirectTo("/login");
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
+
+      const std::string csrf = s->csrf_secret_hex;
+      std::string html = "<!doctype html><html><head><meta charset='utf-8'>"
+                         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                         "<title>Gatehouse – Tenant Overview</title>"
+                         "<style>"
+                         "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:1100px;background:#f9f9f9;color:#222}"
+                         ".card{background:#fff;padding:20px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05);margin-bottom:20px}"
+                         "h1,h2,h3{margin-top:0} a{color:#0b57d0;font-weight:600;text-decoration:none} a:hover{text-decoration:underline}"
+                         "table{width:100%;border-collapse:collapse;margin-top:12px}"
+                         "th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;font-size:14px;vertical-align:top}"
+                         "th{font-weight:600;background:#fafafa}"
+                         "code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:0.88em}"
+                         ".host-pill{display:inline-block;background:#e8f0fe;color:#1a73e8;padding:2px 8px;border-radius:999px;font-size:12px;margin:2px 2px 2px 0}"
+                         ".err{color:#b00020} .muted{color:#777;font-size:13px}"
+                         "select{padding:8px;border-radius:6px;border:1px solid #ccc;font-size:14px;margin-right:8px}"
+                         "button{padding:9px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600}"
+                         "button:hover{background:#0842a0}"
+                         "</style></head><body>"
+                         "<h1>Tenant &amp; User Overview</h1>"
+                         "<p><a href='/portal'>&larr; Back to portal</a></p>"
+                         "<div class='card'>"
+                         "<h2>Select Tenant</h2>"
+                         "<select id='tenantSel'><option value=''>Loading...</option></select>"
+                         "<button id='btnLoad'>Load Users &amp; Hosts</button>"
+                         "<p id='status' class='muted'></p>"
+                         "</div>"
+                         "<div id='result'></div>"
+                         "<script>";
+
+      html += "const CSRF = '" + csrf + "';\n";
+      html += R"JS(
+const STATUS_NAMES = {
+  '-1': {label:'None',      bg:'#f0f0f0', fg:'#555'},
+   '0': {label:'Invited',   bg:'#fff3cd', fg:'#856404'},
+   '1': {label:'LinkVerified', bg:'#cfe2ff', fg:'#0a58ca'},
+   '2': {label:'StepupSent',   bg:'#cfe2ff', fg:'#0a58ca'},
+   '3': {label:'StepupVerified', bg:'#d1ecf1', fg:'#0c5460'},
+   '4': {label:'Completed', bg:'#d1e7dd', fg:'#0f5132'},
+   '5': {label:'Expired',   bg:'#f8d7da', fg:'#842029'},
+   '6': {label:'Revoked',   bg:'#f8d7da', fg:'#842029'},
+};
+
+function statusPill(status, expiresAt) {
+  const s = String(status);
+  const info = STATUS_NAMES[s] || {label:'Unknown', bg:'#eee', fg:'#333'};
+  let label = info.label;
+  // Mark as expired if past expiry but status is not yet set
+  if ((status === 0 || status === 1 || status === 2 || status === 3) && expiresAt > 0 && expiresAt < Date.now()/1000) {
+    label = 'Expired'; return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:#f8d7da;color:#842029">' + label + '</span>';
+  }
+  return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:' + info.bg + ';color:' + info.fg + '">' + label + '</span>';
+}
+
+async function loadTenants() {
+  const r = await fetch('/api/admin/tenants');
+  const j = await r.json().catch(() => null);
+  const sel = document.getElementById('tenantSel');
+  if (!r.ok || !j || !j.items) { sel.innerHTML = '<option>Error loading tenants</option>'; return; }
+  sel.innerHTML = '<option value="">-- choose tenant --</option>';
+  for (const t of j.items) {
+    const o = document.createElement('option');
+    o.value = t; o.textContent = t;
+    sel.appendChild(o);
+  }
+}
+
+async function sendInvite(tenantId, uid, btnEl) {
+  btnEl.disabled = true;
+  const orig = btnEl.textContent;
+  btnEl.textContent = 'Sending...';
+  const r = await fetch('/api/admin/invites', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
+    body: JSON.stringify({tenant_ou: tenantId, uid})
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    alert('Failed: ' + (j && j.error ? j.error : r.status));
+    btnEl.disabled = false;
+    btnEl.textContent = orig;
+    return;
+  }
+  // Refresh the table to show updated status
+  await loadUsers();
+}
+
+async function loadUsers() {
+  const t = document.getElementById('tenantSel').value;
+  if (!t) { document.getElementById('status').textContent = 'Please select a tenant.'; return; }
+  document.getElementById('status').textContent = 'Loading...';
+  document.getElementById('result').innerHTML = '';
+  const r = await fetch('/api/admin/tenant-users?tenant_id=' + encodeURIComponent(t),
+                        {headers: {'X-CSRF-Token': CSRF}});
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j) {
+    document.getElementById('status').textContent = 'Error: ' + (j && j.error ? j.error : r.status);
+    return;
+  }
+  const users = j.users || [];
+  document.getElementById('status').textContent = users.length + ' user(s) found.';
+
+  if (users.length === 0) {
+    document.getElementById('result').innerHTML = '<div class="card"><p>No users found in this tenant.</p></div>';
+    return;
+  }
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<h2>Users in <code>' + escHtml(t) + '</code></h2>';
+
+  const table = document.createElement('table');
+  table.innerHTML =
+    '<thead><tr><th>UID</th><th>First Name</th><th>Last Name</th><th>Email</th>' +
+    '<th>Invitation</th><th>Managed Hosts</th><th>Actions</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+
+  for (const u of users) {
+    const tr = document.createElement('tr');
+
+    // Hosts
+    let hostsHtml = '';
+    if (u.hosts && u.hosts.length > 0) {
+      for (const h of u.hosts) {
+        hostsHtml += '<span class="host-pill" title="' + escHtml(h.dn) + '">';
+        hostsHtml += escHtml(h.hostname || h.dn);
+        if (h.ip) hostsHtml += ' <code>' + escHtml(h.ip) + '</code>';
+        hostsHtml += '</span>';
+      }
+    } else {
+      hostsHtml = '<span class="muted">—</span>';
+    }
+
+    // Invite status
+    const st = u.invite_status;
+    let invHtml = statusPill(st, u.invite_expires_at);
+    if (st >= 0 && u.invite_created_at > 0) {
+      invHtml += '<br><span class="muted">' + new Date(u.invite_created_at * 1000).toLocaleDateString() + '</span>';
+    }
+    if (u.invite_expires_at > 0 && st !== 4) {
+      const exp = new Date(u.invite_expires_at * 1000);
+      invHtml += '<br><span class="muted" title="Expires">exp: ' + exp.toLocaleDateString() + '</span>';
+    }
+
+    tr.innerHTML =
+      '<td><code>' + escHtml(u.uid) + '</code></td>' +
+      '<td>' + escHtml(u.given_name) + '</td>' +
+      '<td>' + escHtml(u.surname) + '</td>' +
+      '<td>' + escHtml(u.mail) + '</td>' +
+      '<td>' + invHtml + '</td>' +
+      '<td>' + hostsHtml + '</td>' +
+      '<td></td>';
+
+    // Action button
+    const td = tr.querySelectorAll('td')[6];
+    const isActive = st === 0 || st === 1 || st === 2 || st === 3;
+    const isCompleted = st === 4;
+    if (!isCompleted) {
+      const btn = document.createElement('button');
+      btn.textContent = isActive ? 'Resend' : 'Send Invite';
+      btn.style.cssText = 'padding:5px 10px;font-size:13px;';
+      btn.onclick = () => sendInvite(t, u.uid, btn);
+      td.appendChild(btn);
+    }
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  card.appendChild(table);
+  document.getElementById('result').appendChild(card);
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+document.getElementById('btnLoad').addEventListener('click', loadUsers);
+loadTenants();
+)JS";
+      html += "</script></body></html>";
+      return HtmlPage(200, html);
+    });
+
+    CROW_ROUTE(app, "/api/admin/tenants").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      auto res = ldap_dir->ListTenants();
+      if (!res.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] ListTenants failed: %s\n",
+                     res.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["items"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& t : res.value()) {
+        v["items"][idx++] = t;
+      }
+      return Json(200, v);
+    });
+
+    CROW_ROUTE(app, "/api/admin/tenant-users").methods("GET"_method)([&](const crow::request& req) {
+      auto s = require_auth(req);
+      if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+      if (!csrf_ok_header(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+      if (!IsAdminUid(cfg_, ldap_dir, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+      if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
+
+      const std::string tenant = req.url_params.get("tenant_id") ? req.url_params.get("tenant_id") : "";
+      if (tenant.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id required"; return Json(400, v); }
+
+      auto res = ldap_dir->ListUsersWithHosts(tenant);
+      if (!res.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] ListUsersWithHosts failed for %s: %s\n",
+                     tenant.c_str(), res.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
+
+      // Build uid -> latest invite map.
+      auto inv_res = invites.GetLatestPerUid(tenant);
+      std::unordered_map<std::string, infra::InviteRow> inv_map;
+      if (inv_res.ok()) {
+        for (auto& row : inv_res.value()) {
+          inv_map[row.invited_uid] = std::move(row);
+        }
+      }
+
+      crow::json::wvalue v;
+      v["ok"] = true;
+      v["tenant_id"] = tenant;
+      v["users"] = crow::json::wvalue::list();
+      unsigned int idx = 0;
+      for (const auto& u : res.value()) {
+        crow::json::wvalue uj;
+        uj["uid"]        = u.uid;
+        uj["given_name"] = u.given_name;
+        uj["surname"]    = u.surname;
+        uj["mail"]       = u.mail;
+
+        auto it = inv_map.find(u.uid);
+        if (it != inv_map.end()) {
+          const auto& inv = it->second;
+          uj["invite_id"]          = inv.invite_id;
+          uj["invite_status"]      = static_cast<int>(inv.status);
+          uj["invite_status_name"] = InviteStatusName(inv.status);
+          uj["invite_expires_at"]  = inv.expires_at;
+          uj["invite_created_at"]  = inv.created_at;
+        } else {
+          uj["invite_status"]      = -1;
+          uj["invite_status_name"] = "None";
+          uj["invite_expires_at"]  = 0;
+          uj["invite_created_at"]  = 0;
+        }
+
+        uj["hosts"] = crow::json::wvalue::list();
+        unsigned int hidx = 0;
+        for (const auto& h : u.hosts) {
+          crow::json::wvalue hj;
+          hj["dn"]       = h.dn;
+          hj["hostname"] = h.hostname;
+          hj["ip"]       = h.ip;
+          uj["hosts"][hidx++] = std::move(hj);
+        }
+        v["users"][idx++] = std::move(uj);
+      }
+      return Json(200, v);
+    });
+
+        app.bindaddr(cfg_.bind_addr)
         .port(static_cast<std::uint16_t>(cfg_.port))
         .concurrency(cfg_.threads)
         .run();
@@ -2135,6 +2883,7 @@ START OF FILE: src/infra/invite_otp_repo.cc
 #include <utility>
 #include <vector>
 
+#include <openssl/crypto.h>
 #include <sqlite3.h>
 
 namespace gatehouse::infra {
@@ -2219,9 +2968,10 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   if (!tx.ok()) return core::Result<bool>::Err(tx.status());
 
   sqlite3_stmt* sel = nullptr;
+  // Wir filtern NICHT mehr nach otp_hash, um falsche Eingaben mitzählen zu können.
   const char* sel_sql =
-      "SELECT otp_id, attempts, max_attempts FROM invite_otp "
-      "WHERE sid=? AND otp_hash=? AND consumed_at IS NULL AND expires_at>? "
+      "SELECT otp_id, attempts, max_attempts, expires_at, otp_hash FROM invite_otp "
+      "WHERE sid=? AND consumed_at IS NULL "
       "ORDER BY issued_at DESC LIMIT 1;";
   int rc = sqlite3_prepare_v2(dbh, sel_sql, -1, &sel, nullptr);
   if (rc != SQLITE_OK) {
@@ -2230,8 +2980,6 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   }
 
   (void)sqlite3_bind_text(sel, 1, sid.c_str(), -1, SQLITE_TRANSIENT);
-  (void)sqlite3_bind_blob(sel, 2, otp_hash.data(), static_cast<int>(otp_hash.size()), SQLITE_TRANSIENT);
-  (void)sqlite3_bind_int64(sel, 3, now);
 
   rc = sqlite3_step(sel);
   if (rc != SQLITE_ROW) {
@@ -2244,25 +2992,42 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   const std::string otp_id = reinterpret_cast<const char*>(sqlite3_column_text(sel, 0));
   const int attempts = sqlite3_column_int(sel, 1);
   const int max_attempts = sqlite3_column_int(sel, 2);
+  const std::int64_t expires_at = sqlite3_column_int64(sel, 3);
+  
+  const void* blob_ptr = sqlite3_column_blob(sel, 4);
+  const int blob_bytes = sqlite3_column_bytes(sel, 4);
+  std::vector<std::uint8_t> db_hash;
+  if (blob_ptr && blob_bytes > 0) {
+    const auto* b = static_cast<const std::uint8_t*>(blob_ptr);
+    db_hash.assign(b, b + blob_bytes);
+  }
   sqlite3_finalize(sel);
 
-  if (attempts >= max_attempts) {
+  // Abbruch, wenn bereits abgelaufen oder zu viele Versuche.
+  if (expires_at <= now || attempts >= max_attempts) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Ok(false);
   }
 
+  // Constant-time comparison to prevent timing attacks.
+  const bool matched = (db_hash.size() == otp_hash.size() && !db_hash.empty() &&
+                        CRYPTO_memcmp(db_hash.data(), otp_hash.data(), db_hash.size()) == 0);
+
   sqlite3_stmt* upd = nullptr;
   const char* upd_sql =
-      "UPDATE invite_otp SET consumed_at=?, attempts=attempts+1 "
-      "WHERE otp_id=? AND consumed_at IS NULL;";
+      "UPDATE invite_otp SET attempts = attempts + 1, "
+      "consumed_at = CASE WHEN ? THEN ? ELSE consumed_at END "
+      "WHERE otp_id = ?;";
   rc = sqlite3_prepare_v2(dbh, upd_sql, -1, &upd, nullptr);
   if (rc != SQLITE_OK) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "prepare(update invite_otp)"));
   }
 
-  (void)sqlite3_bind_int64(upd, 1, now);
-  (void)sqlite3_bind_text(upd, 2, otp_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_int(upd, 1, matched ? 1 : 0);
+  (void)sqlite3_bind_int64(upd, 2, now);
+  (void)sqlite3_bind_text(upd, 3, otp_id.c_str(), -1, SQLITE_TRANSIENT);
+
   rc = sqlite3_step(upd);
   sqlite3_finalize(upd);
 
@@ -2274,7 +3039,32 @@ core::Result<bool> InviteOtpRepo::VerifyAndConsume(const std::string& sid,
   auto cm = db_.Exec("COMMIT;");
   if (!cm.ok()) return core::Result<bool>::Err(cm.status());
 
-  return core::Result<bool>::Ok(true);
+  return core::Result<bool>::Ok(matched);
+}
+
+
+core::Result<std::optional<std::int64_t>> InviteOtpRepo::GetLastIssuedAt(const std::string& sid) {
+  sqlite3* dbh = db_.handle();
+  if (!dbh) return core::Result<std::optional<std::int64_t>>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql = "SELECT issued_at FROM invite_otp WHERE sid=? ORDER BY issued_at DESC LIMIT 1;";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<std::optional<std::int64_t>>::Err(StmtErr(rc, dbh, "prepare(get_last_issued)"));
+
+  (void)sqlite3_bind_text(stmt, 1, sid.c_str(), -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(stmt);
+  
+  std::optional<std::int64_t> res;
+  if (rc == SQLITE_ROW) {
+    res = sqlite3_column_int64(stmt, 0);
+  } else if (rc != SQLITE_DONE) {
+    sqlite3_finalize(stmt);
+    return core::Result<std::optional<std::int64_t>>::Err(StmtErr(rc, dbh, "step(get_last_issued)"));
+  }
+  
+  sqlite3_finalize(stmt);
+  return core::Result<std::optional<std::int64_t>>::Ok(res);
 }
 
 }  // namespace gatehouse::infra
@@ -2521,6 +3311,95 @@ core::Result<std::vector<InviteRow>> InviteRepo::ListLatest(std::int32_t limit,
   return core::Result<std::vector<InviteRow>>::Ok(std::move(out));
 }
 
+
+core::Result<std::vector<std::string>> InviteRepo::GetInvitedUids(const std::string& tenant_id,
+                                                                     std::int64_t now) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<std::vector<std::string>>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  // A user counts as "already invited" if they have a completed invite (status=4)
+  // or a non-revoked invite that has not yet expired.
+  const char* sql =
+      "SELECT DISTINCT invited_uid FROM invite "
+      "WHERE tenant_id=? AND invited_uid IS NOT NULL AND status != 6 "
+      "AND (status = 4 OR expires_at > ?);";
+  sqlite3_stmt* stmt = nullptr;
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<std::vector<std::string>>::Err(StmtErr(rc, dbh, "prepare(get_invited_uids)"));
+
+  (void)sqlite3_bind_text(stmt, 1, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_int64(stmt, 2, now);
+
+  std::vector<std::string> out;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    out.push_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+  }
+  sqlite3_finalize(stmt);
+
+  if (rc != SQLITE_DONE) return core::Result<std::vector<std::string>>::Err(StmtErr(rc, dbh, "step(get_invited_uids)"));
+  return core::Result<std::vector<std::string>>::Ok(std::move(out));
+}
+
+core::Result<void> InviteRepo::RevokePending(const std::string& tenant_id,
+                                             const std::string& uid,
+                                             std::int64_t now) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql =
+      "UPDATE invite SET status=6, revoked_at=? "
+      "WHERE tenant_id=? AND invited_uid=? AND status NOT IN (4, 6);";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<void>::Err(StmtErr(rc, dbh, "prepare(revoke_pending)"));
+
+  (void)sqlite3_bind_int64(stmt, 1, now);
+  (void)sqlite3_bind_text(stmt, 2, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_text(stmt, 3, uid.c_str(), -1, SQLITE_TRANSIENT);
+
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(rc, dbh, "step(revoke_pending)"));
+  return core::Result<void>::Ok();
+}
+
+
+core::Result<std::vector<InviteRow>> InviteRepo::GetLatestPerUid(const std::string& tenant_id) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<std::vector<InviteRow>>::Err(
+      core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  // For each uid in the tenant, return the most recently created invite.
+  const char* sql =
+      "SELECT i.invite_id,i.tenant_id,i.invited_email,COALESCE(i.invited_uid,''),"
+      "i.token_hash,i.status,i.created_at,i.expires_at,"
+      "i.consumed_at,i.revoked_at,COALESCE(i.created_by,'') "
+      "FROM invite i "
+      "INNER JOIN ("
+      "  SELECT invited_uid, MAX(created_at) AS max_at "
+      "  FROM invite WHERE tenant_id=? AND invited_uid IS NOT NULL "
+      "  GROUP BY invited_uid"
+      ") latest ON i.invited_uid = latest.invited_uid AND i.created_at = latest.max_at "
+      "WHERE i.tenant_id=?;";
+
+  sqlite3_stmt* stmt = nullptr;
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<std::vector<InviteRow>>::Err(
+      StmtErr(rc, dbh, "prepare(get_latest_per_uid)"));
+
+  (void)sqlite3_bind_text(stmt, 1, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_text(stmt, 2, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+
+  std::vector<InviteRow> out;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    out.push_back(ReadInvite(stmt));
+  }
+  sqlite3_finalize(stmt);
+
+  if (rc != SQLITE_DONE) return core::Result<std::vector<InviteRow>>::Err(
+      StmtErr(rc, dbh, "step(get_latest_per_uid)"));
+  return core::Result<std::vector<InviteRow>>::Ok(std::move(out));
+}
 }  // namespace gatehouse::infra
 
 --------------------------------------------------
@@ -2707,6 +3586,162 @@ END OF FILE: src/infra/invite_session_repo.cc
 
 
 vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+START OF FILE: src/infra/kadm5_client.cc
+--------------------------------------------------
+#include "infra/kadm5_client.h"
+
+#include <kadm5/admin.h>
+#include <kdb.h>
+#include <krb5.h>
+
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "krb5_helpers.h"
+
+namespace gatehouse::infra {
+namespace {
+
+class ScopedKadm5Handle {
+ public:
+  ScopedKadm5Handle() = default;
+
+  ~ScopedKadm5Handle() {
+    if (handle_ != nullptr) {
+      (void)kadm5_destroy(handle_);
+    }
+  }
+
+  ScopedKadm5Handle(const ScopedKadm5Handle&) = delete;
+  ScopedKadm5Handle& operator=(const ScopedKadm5Handle&) = delete;
+
+  ScopedKadm5Handle(ScopedKadm5Handle&&) = delete;
+  ScopedKadm5Handle& operator=(ScopedKadm5Handle&&) = delete;
+
+  void** out() noexcept { return &handle_; }
+  void* get() const noexcept { return handle_; }
+
+ private:
+  void* handle_ = nullptr;
+};
+
+}  // namespace
+
+Kadm5Client::Kadm5Client(Kadm5Config cfg) : cfg_(std::move(cfg)) {}
+
+core::Result<void> Kadm5Client::CreatePrincipal(
+    const std::string& new_principal,
+    const std::string& new_password,
+    const std::string& ldap_dn) const {
+  if (cfg_.realm.empty()) {
+    return core::Result<void>::Err(
+        core::Status::Error(
+            core::StatusCode::kFailedPrecondition,
+            "Kadm5 config incomplete: 'realm' is empty "
+            "(did you pass --realm <REALM>?)"));
+  }
+  if (cfg_.admin_principal.empty()) {
+    return core::Result<void>::Err(
+        core::Status::Error(
+            core::StatusCode::kFailedPrecondition,
+            "Kadm5 config incomplete: 'admin_principal' is empty "
+            "(GATEHOUSE_KADM5_ADMIN_PRINC missing)"));
+  }
+  if (cfg_.admin_password.empty()) {
+    return core::Result<void>::Err(
+        core::Status::Error(
+            core::StatusCode::kFailedPrecondition,
+            "Kadm5 config incomplete: 'admin_password' is empty "
+            "(GATEHOUSE_KADM5_ADMIN_PASS missing)"));
+  }
+
+  auto ctx_result = MakeKrb5Context();
+  if (!ctx_result.ok()) {
+    return core::Result<void>::Err(ctx_result.status());
+  }
+  auto ctx = std::move(ctx_result.value());
+
+  kadm5_config_params params;
+  std::memset(&params, 0, sizeof(params));
+  params.mask = KADM5_CONFIG_REALM;
+  params.realm = const_cast<char*>(cfg_.realm.c_str());
+
+  if (!cfg_.admin_server.empty()) {
+    params.mask |= KADM5_CONFIG_ADMIN_SERVER;
+    params.admin_server = const_cast<char*>(cfg_.admin_server.c_str());
+  }
+
+  ScopedKadm5Handle handle;
+  char* db_args[] = {nullptr};
+
+  const kadm5_ret_t init_ret = kadm5_init_with_password(
+      ctx.get(),
+      const_cast<char*>(cfg_.admin_principal.c_str()),
+      const_cast<char*>(cfg_.admin_password.c_str()),
+      const_cast<char*>("kadmin/admin"),
+      &params,
+      KADM5_STRUCT_VERSION,
+      KADM5_API_VERSION_4,
+      db_args,
+      handle.out());
+  if (init_ret != 0) {
+    return core::Result<void>::Err(
+        Kadm5ErrorStatus("kadm5_init_with_password", ctx.get(),init_ret));
+  }
+
+  auto principal_result = ParseKrb5Principal(ctx.get(), new_principal);
+  if (!principal_result.ok()) {
+    return core::Result<void>::Err(principal_result.status());
+  }
+  auto principal = std::move(principal_result.value());
+
+  kadm5_principal_ent_rec ent;
+  std::memset(&ent, 0, sizeof(ent));
+  ent.principal = principal.get();
+
+  long mask = KADM5_PRINCIPAL;
+
+  krb5_tl_data tl;
+  std::memset(&tl, 0, sizeof(tl));
+  std::vector<unsigned char> tl_contents;
+
+  if (!ldap_dn.empty()) {
+    const std::string dbarg = "dn=" + ldap_dn;
+    tl_contents.assign(dbarg.begin(), dbarg.end());
+    tl_contents.push_back('\0');
+
+    tl.tl_data_type = KRB5_TL_DB_ARGS;
+    tl.tl_data_length = static_cast<short unsigned int> (tl_contents.size());
+    tl.tl_data_contents = reinterpret_cast<krb5_octet*>(tl_contents.data());
+    tl.tl_data_next = nullptr;
+
+    ent.tl_data = &tl;
+    ent.n_tl_data = 1;
+    mask |= KADM5_TL_DATA;
+  }
+
+  const kadm5_ret_t create_ret = kadm5_create_principal(
+      handle.get(),
+      &ent,
+      mask,
+      const_cast<char*>(new_password.c_str()));
+
+  if (create_ret != 0) {
+    return core::Result<void>::Err(
+        Kadm5ErrorStatus("kadm5_create_principal",ctx.get(), create_ret));
+  }
+
+  return core::Result<void>::Ok();
+}
+
+}  // namespace gatehouse::infra
+--------------------------------------------------
+END OF FILE: src/infra/kadm5_client.cc
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
 START OF FILE: src/infra/krb5_client.cc
 --------------------------------------------------
 #include "infra/krb5_client.h"
@@ -2718,52 +3753,51 @@ START OF FILE: src/infra/krb5_client.cc
 #include <utility>
 #include <vector>
 
-#include <krb5.h>
 #include <unistd.h>
+
+#include "krb5_helpers.h"
 
 namespace gatehouse::infra {
 namespace {
-
-core::Status KErr(const char* what, krb5_context ctx, krb5_error_code code) {
-  const char* msg = (ctx != nullptr) ? krb5_get_error_message(ctx, code) : nullptr;
-  std::string s = std::string(what) + " (krb5=" + std::to_string(static_cast<int>(code)) + ")";
-  if (msg != nullptr) {
-    s += ": ";
-    s += msg;
-  }
-  if (ctx != nullptr && msg != nullptr) {
-    krb5_free_error_message(ctx, msg);
-  }
-  return core::Status::Error(core::StatusCode::kUnauthenticated, std::move(s));
-}
 
 core::Result<std::vector<std::uint8_t>> ReadAll(const std::string& path) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (f == nullptr) {
     return core::Result<std::vector<std::uint8_t>>::Err(
         core::Status::Error(core::StatusCode::kNotFound,
-                            "fopen failed: " + path + " errno=" + std::to_string(errno)));
+                            "fopen failed: " + path + " errno=" +
+                                std::to_string(errno)));
   }
-  std::vector<std::uint8_t> buf;
-  std::fseek(f, 0, SEEK_END);
-  const long sz = std::ftell(f);
-  if (sz < 0) {
+
+  if (std::fseek(f, 0, SEEK_END) != 0) {
+    std::fclose(f);
+    return core::Result<std::vector<std::uint8_t>>::Err(
+        core::Status::Error(core::StatusCode::kInternal, "fseek failed"));
+  }
+
+  const long size = std::ftell(f);
+  if (size < 0) {
     std::fclose(f);
     return core::Result<std::vector<std::uint8_t>>::Err(
         core::Status::Error(core::StatusCode::kInternal, "ftell failed"));
   }
+
   std::rewind(f);
-  buf.resize(static_cast<std::size_t>(sz));
-  if (sz > 0) {
-    const std::size_t got = std::fread(buf.data(), 1, buf.size(), f);
-    if (got != buf.size()) {
+
+  std::vector<std::uint8_t> buffer;
+  buffer.resize(static_cast<std::size_t>(size));
+
+  if (size > 0) {
+    const std::size_t got = std::fread(buffer.data(), 1, buffer.size(), f);
+    if (got != buffer.size()) {
       std::fclose(f);
       return core::Result<std::vector<std::uint8_t>>::Err(
           core::Status::Error(core::StatusCode::kInternal, "fread failed"));
     }
   }
+
   std::fclose(f);
-  return core::Result<std::vector<std::uint8_t>>::Ok(std::move(buf));
+  return core::Result<std::vector<std::uint8_t>>::Ok(std::move(buffer));
 }
 
 }  // namespace
@@ -2771,8 +3805,12 @@ core::Result<std::vector<std::uint8_t>> ReadAll(const std::string& path) {
 Krb5Client::Krb5Client(Krb5Config cfg) : cfg_(std::move(cfg)) {}
 
 std::string Krb5Client::MakePrincipal(const std::string& username) const {
-  if (username.find('@') != std::string::npos) return username;
-  if (cfg_.realm.empty()) return username;
+  if (username.find('@') != std::string::npos) {
+    return username;
+  }
+  if (cfg_.realm.empty()) {
+    return username;
+  }
   return username + "@" + cfg_.realm;
 }
 
@@ -2780,151 +3818,551 @@ core::Result<Krb5VerifyResult> Krb5Client::VerifyPasswordAndGetCcache(
     const std::string& username, const std::string& password) const {
   if (username.empty() || password.empty()) {
     return core::Result<Krb5VerifyResult>::Err(
-        core::Status::Error(core::StatusCode::kInvalidArgument, "missing username/password"));
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "missing username/password"));
   }
 
-  krb5_context ctx = nullptr;
-  krb5_error_code rc = krb5_init_context(&ctx);
+  auto ctx_result = MakeKrb5Context();
+  if (!ctx_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(ctx_result.status());
+  }
+  auto ctx = std::move(ctx_result.value());
+
+  const std::string principal_name = MakePrincipal(username);
+
+  auto principal_result = ParseKrb5Principal(ctx.get(), principal_name);
+  if (!principal_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(principal_result.status());
+  }
+  auto principal = std::move(principal_result.value());
+
+  auto opt_result = MakeKrb5InitCredsOpt(ctx.get());
+  if (!opt_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(opt_result.status());
+  }
+  auto opt = std::move(opt_result.value());
+
+  ScopedKrb5Creds creds(ctx.get());
+
+  auto acquire_result = AcquireKrb5TgtWithPassword(
+      ctx.get(), creds.get(), principal.get(), password, opt.get());
+  if (!acquire_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(acquire_result.status());
+  }
+
+  auto unparsed_result = UnparseKrb5Principal(ctx.get(), principal.get());
+  if (!unparsed_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(unparsed_result.status());
+  }
+  auto unparsed = std::move(unparsed_result.value());
+
+  auto ccache_result = MakeUniqueFileCcache(ctx.get());
+  if (!ccache_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(ccache_result.status());
+  }
+  auto ccache = std::move(ccache_result.value());
+
+  krb5_error_code rc = krb5_cc_initialize(ctx.get(), ccache.get(), principal.get());
   if (rc != 0) {
     return core::Result<Krb5VerifyResult>::Err(
-        core::Status::Error(core::StatusCode::kUnavailable, "krb5_init_context failed"));
+        Krb5ErrorStatus("krb5_cc_initialize", ctx.get(), rc));
   }
 
-  const std::string principal_str = MakePrincipal(username);
-
-  krb5_principal princ = nullptr;
-  rc = krb5_parse_name(ctx, principal_str.c_str(), &princ);
+  rc = krb5_cc_store_cred(ctx.get(), ccache.get(), creds.get());
   if (rc != 0) {
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_parse_name", ctx, rc));
+    return core::Result<Krb5VerifyResult>::Err(
+        Krb5ErrorStatus("krb5_cc_store_cred", ctx.get(), rc));
   }
 
-  krb5_get_init_creds_opt* opt = nullptr;
-  rc = krb5_get_init_creds_opt_alloc(ctx, &opt);
+  auto full_name_result = GetKrb5CcacheFullName(ctx.get(), ccache.get());
+  if (!full_name_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(full_name_result.status());
+  }
+  auto full_name = std::move(full_name_result.value());
+
+  std::string path = full_name.get();
+  constexpr char kFilePrefix[] = "FILE:";
+  if (path.rfind(kFilePrefix, 0) == 0) {
+    path.erase(0, sizeof(kFilePrefix) - 1);
+  }
+
+  rc = krb5_cc_close(ctx.get(), ccache.release());
   if (rc != 0) {
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_get_init_creds_opt_alloc", ctx, rc));
+    return core::Result<Krb5VerifyResult>::Err(
+        Krb5ErrorStatus("krb5_cc_close", ctx.get(), rc));
   }
 
-  krb5_creds creds{};
-  std::memset(&creds, 0, sizeof(creds));
+  auto blob_result = ReadAll(path);
 
-  rc = krb5_get_init_creds_password(
-      ctx, &creds, princ, password.c_str(),
-      /*prompter=*/nullptr, /*data=*/nullptr,
-      /*start_time=*/0,
-      /*in_tkt_service=*/nullptr, opt);
-
-  krb5_get_init_creds_opt_free(ctx, opt);
-
-  if (rc != 0) {
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_get_init_creds_password", ctx, rc));
-  }
-
-  char* unparsed = nullptr;
-  rc = krb5_unparse_name(ctx, princ, &unparsed);
-  if (rc != 0 || unparsed == nullptr) {
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_unparse_name", ctx, rc));
-  }
-
-  // Write creds to a unique FILE ccache, then read bytes and delete the file.
-  krb5_ccache cc = nullptr;
-  rc = krb5_cc_new_unique(ctx, "FILE", nullptr, &cc);
-  if (rc != 0) {
-    krb5_free_unparsed_name(ctx, unparsed);
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_cc_new_unique(FILE)", ctx, rc));
-  }
-
-  rc = krb5_cc_initialize(ctx, cc, princ);
-  if (rc != 0) {
-    krb5_cc_destroy(ctx, cc);
-    krb5_free_unparsed_name(ctx, unparsed);
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_cc_initialize", ctx, rc));
-  }
-
-  rc = krb5_cc_store_cred(ctx, cc, &creds);
-  if (rc != 0) {
-    krb5_cc_destroy(ctx, cc);
-    krb5_free_unparsed_name(ctx, unparsed);
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_cc_store_cred", ctx, rc));
-  }
-
-  char* full = nullptr;
-  rc = krb5_cc_get_full_name(ctx, cc, &full);
-  if (rc != 0 || full == nullptr) {
-    krb5_cc_destroy(ctx, cc);
-    krb5_free_unparsed_name(ctx, unparsed);
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_cc_get_full_name", ctx, rc));
-  }
-
-  // full looks like "FILE:/tmp/krb5cc_XXXXXX". Extract path after "FILE:".
-  std::string full_name = full;
-  krb5_free_string(ctx, full);
-
-  const std::string prefix = "FILE:";
-  std::string path = full_name;
-  if (path.rfind(prefix, 0) == 0) path = path.substr(prefix.size());
-
-  // Close and destroy the ccache; for FILE, destroy removes the file.
-  // But we need file bytes -> read BEFORE destroy. Close keeps file.
-  rc = krb5_cc_close(ctx, cc);
-  if (rc != 0) {
-    krb5_free_unparsed_name(ctx, unparsed);
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(KErr("krb5_cc_close", ctx, rc));
-  }
-
-  auto blob = ReadAll(path);
-
-  // Best-effort delete file.
+  // Best effort cleanup of the temp FILE ccache.
   (void)::unlink(path.c_str());
 
-  if (!blob.ok()) {
-    krb5_free_unparsed_name(ctx, unparsed);
-    krb5_free_cred_contents(ctx, &creds);
-    krb5_free_principal(ctx, princ);
-    krb5_free_context(ctx);
-    return core::Result<Krb5VerifyResult>::Err(blob.status());
+  if (!blob_result.ok()) {
+    return core::Result<Krb5VerifyResult>::Err(blob_result.status());
   }
 
   Krb5VerifyResult out;
-  out.principal = unparsed;
-  out.tgt_expires_at = static_cast<std::int64_t>(creds.times.endtime);
-  out.ccache_blob = std::move(blob.value());
-
-  krb5_free_unparsed_name(ctx, unparsed);
-  krb5_free_cred_contents(ctx, &creds);
-  krb5_free_principal(ctx, princ);
-  krb5_free_context(ctx);
+  out.principal = unparsed.get();
+  out.tgt_expires_at = static_cast<std::int64_t>(creds.get()->times.endtime);
+  out.ccache_blob = std::move(blob_result.value());
 
   return core::Result<Krb5VerifyResult>::Ok(std::move(out));
 }
 
-}  // namespace gatehouse::infra
+core::Result<void> Krb5Client::ChangePassword(
+    const std::string& username,
+    const std::string& old_password,
+    const std::string& new_password) const {
+  if (username.empty() || old_password.empty() || new_password.empty()) {
+    return core::Result<void>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "missing credentials"));
+  }
 
+  auto ctx_result = MakeKrb5Context();
+  if (!ctx_result.ok()) {
+    return core::Result<void>::Err(ctx_result.status());
+  }
+  auto ctx = std::move(ctx_result.value());
+
+  const std::string principal_name = MakePrincipal(username);
+
+  auto principal_result = ParseKrb5Principal(ctx.get(), principal_name);
+  if (!principal_result.ok()) {
+    return core::Result<void>::Err(principal_result.status());
+  }
+  auto principal = std::move(principal_result.value());
+
+  auto opt_result = MakeKrb5InitCredsOpt(ctx.get());
+  if (!opt_result.ok()) {
+    return core::Result<void>::Err(opt_result.status());
+  }
+  auto opt = std::move(opt_result.value());
+
+  ScopedKrb5Creds creds(ctx.get());
+
+  auto acquire_result = AcquireKrb5ChangePasswordCreds(
+      ctx.get(), creds.get(), principal.get(), old_password, opt.get());
+  if (!acquire_result.ok()) {
+    return core::Result<void>::Err(acquire_result.status());
+  }
+
+  int result_code = 0;
+  ScopedKrb5Data result_code_string(ctx.get());
+  ScopedKrb5Data result_string(ctx.get());
+
+  const krb5_error_code rc = krb5_change_password(
+      ctx.get(),
+      creds.get(),
+      const_cast<char*>(new_password.c_str()),
+      &result_code,
+      result_code_string.get(),
+      result_string.get());
+
+  std::string rejection_message = "Unknown rejection";
+  if (result_code != 0) {
+    const std::string result_text = result_string.ToString();
+    const std::string result_code_text = result_code_string.ToString();
+
+    if (!result_text.empty()) {
+      rejection_message = result_text;
+    } else if (!result_code_text.empty()) {
+      rejection_message = result_code_text;
+    }
+  }
+
+  if (rc != 0) {
+    return core::Result<void>::Err(
+        Krb5ErrorStatus("krb5_change_password failed", ctx.get(), rc));
+  }
+
+  if (result_code != 0) {
+    return core::Result<void>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "Password rejected by policy: " +
+                                rejection_message));
+  }
+
+  return core::Result<void>::Ok();
+}
+
+}  // namespace gatehouse::infra
 --------------------------------------------------
 END OF FILE: src/infra/krb5_client.cc
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+START OF FILE: src/infra/krb5_helpers.h
+--------------------------------------------------
+#pragma once
+
+#include <cstring>
+#include <memory>
+#include <string>
+#include <type_traits>
+
+#include <krb5.h>
+#include <kadm5/admin.h>
+/*
+extern "C" {
+     #include <com_err.h> failed
+    extern const char* error_message(long);
+}
+*/
+#include "core/result.h"
+#include "core/status.h"
+
+namespace gatehouse::infra {
+
+inline core::Status Krb5ErrorStatus(const char* what,
+                                    krb5_context ctx,
+                                    krb5_error_code code) {
+  const char* msg = (ctx != nullptr) ? krb5_get_error_message(ctx, code) : nullptr;
+
+  std::string text =
+      std::string(what) + " (krb5=" + std::to_string(static_cast<int>(code)) + ")";
+  if (msg != nullptr) {
+    text += ": ";
+    text += msg;
+  }
+
+  if (ctx != nullptr && msg != nullptr) {
+    krb5_free_error_message(ctx, msg);
+  }
+
+  return core::Status::Error(core::StatusCode::kUnauthenticated, std::move(text));
+}
+inline core::Status Kadm5ErrorStatus(const char* what,
+                                     krb5_context ctx,
+                                     kadm5_ret_t code) {
+  const char* msg = krb5_get_error_message(ctx, static_cast<krb5_error_code>(code));
+
+  std::string text =
+      std::string(what) + " (kadm5=" + std::to_string(static_cast<int>(code)) + ")";
+  if (msg != nullptr) {
+    text += ": ";
+    text += msg;
+    krb5_free_error_message(ctx, msg);
+  }
+  return core::Status::Error(core::StatusCode::kInternal, std::move(text));
+}
+struct ContextDeleter {
+  void operator()(krb5_context ctx) const noexcept {
+    if (ctx != nullptr) {
+      krb5_free_context(ctx);
+    }
+  }
+};
+
+using UniqueKrb5Context =
+    std::unique_ptr<std::remove_pointer_t<krb5_context>, ContextDeleter>;
+
+inline core::Result<UniqueKrb5Context> MakeKrb5Context() {
+  krb5_context raw = nullptr;
+  const krb5_error_code rc = krb5_init_context(&raw);
+  if (rc != 0) {
+    return core::Result<UniqueKrb5Context>::Err(
+        core::Status::Error(core::StatusCode::kUnavailable,
+                            "krb5_init_context failed"));
+  }
+  return core::Result<UniqueKrb5Context>::Ok(UniqueKrb5Context(raw));
+}
+
+struct PrincipalDeleter {
+  krb5_context ctx = nullptr;
+
+  void operator()(krb5_principal principal) const noexcept {
+    if (ctx != nullptr && principal != nullptr) {
+      krb5_free_principal(ctx, principal);
+    }
+  }
+};
+
+using UniqueKrb5Principal =
+    std::unique_ptr<std::remove_pointer_t<krb5_principal>, PrincipalDeleter>;
+
+inline core::Result<UniqueKrb5Principal> ParseKrb5Principal(
+    krb5_context ctx, const std::string& principal_name) {
+  if (ctx == nullptr) {
+    return core::Result<UniqueKrb5Principal>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "ParseKrb5Principal: ctx is null"));
+  }
+
+  krb5_principal raw = nullptr;
+  const krb5_error_code rc = krb5_parse_name(ctx, principal_name.c_str(), &raw);
+  if (rc != 0) {
+    return core::Result<UniqueKrb5Principal>::Err(
+        Krb5ErrorStatus("krb5_parse_name", ctx, rc));
+  }
+
+  return core::Result<UniqueKrb5Principal>::Ok(
+      UniqueKrb5Principal(raw, PrincipalDeleter{ctx}));
+}
+
+struct InitCredsOptDeleter {
+  krb5_context ctx = nullptr;
+
+  void operator()(krb5_get_init_creds_opt* opt) const noexcept {
+    if (ctx != nullptr && opt != nullptr) {
+      krb5_get_init_creds_opt_free(ctx, opt);
+    }
+  }
+};
+
+using UniqueKrb5InitCredsOpt =
+    std::unique_ptr<krb5_get_init_creds_opt, InitCredsOptDeleter>;
+
+inline core::Result<UniqueKrb5InitCredsOpt> MakeKrb5InitCredsOpt(krb5_context ctx) {
+  if (ctx == nullptr) {
+    return core::Result<UniqueKrb5InitCredsOpt>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "MakeKrb5InitCredsOpt: ctx is null"));
+  }
+
+  krb5_get_init_creds_opt* raw = nullptr;
+  const krb5_error_code rc = krb5_get_init_creds_opt_alloc(ctx, &raw);
+  if (rc != 0) {
+    return core::Result<UniqueKrb5InitCredsOpt>::Err(
+        Krb5ErrorStatus("krb5_get_init_creds_opt_alloc", ctx, rc));
+  }
+
+  return core::Result<UniqueKrb5InitCredsOpt>::Ok(
+      UniqueKrb5InitCredsOpt(raw, InitCredsOptDeleter{ctx}));
+}
+
+struct UnparsedNameDeleter {
+  krb5_context ctx = nullptr;
+
+  void operator()(char* value) const noexcept {
+    if (ctx != nullptr && value != nullptr) {
+      krb5_free_unparsed_name(ctx, value);
+    }
+  }
+};
+
+using UniqueKrb5UnparsedName = std::unique_ptr<char, UnparsedNameDeleter>;
+
+inline core::Result<UniqueKrb5UnparsedName> UnparseKrb5Principal(
+    krb5_context ctx, krb5_principal principal) {
+  if (ctx == nullptr || principal == nullptr) {
+    return core::Result<UniqueKrb5UnparsedName>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "UnparseKrb5Principal: invalid argument"));
+  }
+
+  char* raw = nullptr;
+  const krb5_error_code rc = krb5_unparse_name(ctx, principal, &raw);
+  if (rc != 0 || raw == nullptr) {
+    return core::Result<UniqueKrb5UnparsedName>::Err(
+        Krb5ErrorStatus("krb5_unparse_name", ctx, rc));
+  }
+
+  return core::Result<UniqueKrb5UnparsedName>::Ok(
+      UniqueKrb5UnparsedName(raw, UnparsedNameDeleter{ctx}));
+}
+
+struct StringDeleter {
+  krb5_context ctx = nullptr;
+
+  void operator()(char* value) const noexcept {
+    if (ctx != nullptr && value != nullptr) {
+      krb5_free_string(ctx, value);
+    }
+  }
+};
+
+using UniqueKrb5String = std::unique_ptr<char, StringDeleter>;
+
+inline core::Result<UniqueKrb5String> GetKrb5CcacheFullName(krb5_context ctx,
+                                                            krb5_ccache ccache) {
+  if (ctx == nullptr || ccache == nullptr) {
+    return core::Result<UniqueKrb5String>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "GetKrb5CcacheFullName: invalid argument"));
+  }
+
+  char* raw = nullptr;
+  const krb5_error_code rc = krb5_cc_get_full_name(ctx, ccache, &raw);
+  if (rc != 0 || raw == nullptr) {
+    return core::Result<UniqueKrb5String>::Err(
+        Krb5ErrorStatus("krb5_cc_get_full_name", ctx, rc));
+  }
+
+  return core::Result<UniqueKrb5String>::Ok(
+      UniqueKrb5String(raw, StringDeleter{ctx}));
+}
+
+inline core::Result<void> GetKrb5InitCredsPassword(
+    krb5_context ctx,
+    krb5_creds* creds,
+    krb5_principal principal,
+    const std::string& password,
+    krb5_get_init_creds_opt* options,
+    const char* service = nullptr,
+    const char* operation_name = "krb5_get_init_creds_password") {
+  if (ctx == nullptr || creds == nullptr || principal == nullptr) {
+    return core::Result<void>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "GetKrb5InitCredsPassword: invalid argument"));
+  }
+
+  char* password_mut = const_cast<char*>(password.c_str());
+  char* service_mut = const_cast<char*>(service);
+
+  const krb5_error_code rc = krb5_get_init_creds_password(
+      ctx,
+      creds,
+      principal,
+      password_mut,
+      /*prompter=*/nullptr,
+      /*data=*/nullptr,
+      /*start_time=*/0,
+      service_mut,
+      options);
+
+  if (rc != 0) {
+    return core::Result<void>::Err(Krb5ErrorStatus(operation_name, ctx, rc));
+  }
+
+  return core::Result<void>::Ok();
+}
+
+inline core::Result<void> AcquireKrb5TgtWithPassword(
+    krb5_context ctx,
+    krb5_creds* creds,
+    krb5_principal principal,
+    const std::string& password,
+    krb5_get_init_creds_opt* options) {
+  return GetKrb5InitCredsPassword(ctx,
+                                  creds,
+                                  principal,
+                                  password,
+                                  options,
+                                  /*service=*/nullptr,
+                                  "krb5_get_init_creds_password");
+}
+
+inline core::Result<void> AcquireKrb5ChangePasswordCreds(
+    krb5_context ctx,
+    krb5_creds* creds,
+    krb5_principal principal,
+    const std::string& old_password,
+    krb5_get_init_creds_opt* options) {
+  return GetKrb5InitCredsPassword(ctx,
+                                  creds,
+                                  principal,
+                                  old_password,
+                                  options,
+                                  "kadmin/changepw",
+                                  "Authentication failed (Old password incorrect?)");
+}
+
+class ScopedKrb5Creds {
+ public:
+  explicit ScopedKrb5Creds(krb5_context ctx) noexcept : ctx_(ctx) {
+    std::memset(&creds_, 0, sizeof(creds_));
+  }
+
+  ~ScopedKrb5Creds() {
+    if (ctx_ != nullptr) {
+      krb5_free_cred_contents(ctx_, &creds_);
+    }
+  }
+
+  ScopedKrb5Creds(const ScopedKrb5Creds&) = delete;
+  ScopedKrb5Creds& operator=(const ScopedKrb5Creds&) = delete;
+
+  ScopedKrb5Creds(ScopedKrb5Creds&&) = delete;
+  ScopedKrb5Creds& operator=(ScopedKrb5Creds&&) = delete;
+
+  krb5_creds* get() noexcept { return &creds_; }
+  const krb5_creds* get() const noexcept { return &creds_; }
+
+ private:
+  krb5_context ctx_ = nullptr;
+  krb5_creds creds_{};
+};
+
+enum class Krb5CcacheCleanupMode {
+  kClose,
+  kDestroy,
+};
+
+struct CcacheDeleter {
+  krb5_context ctx = nullptr;
+  Krb5CcacheCleanupMode mode = Krb5CcacheCleanupMode::kClose;
+
+  void operator()(krb5_ccache ccache) const noexcept {
+    if (ctx == nullptr || ccache == nullptr) {
+      return;
+    }
+
+    if (mode == Krb5CcacheCleanupMode::kDestroy) {
+      (void)krb5_cc_destroy(ctx, ccache);
+      return;
+    }
+
+    (void)krb5_cc_close(ctx, ccache);
+  }
+};
+
+using UniqueKrb5Ccache =
+    std::unique_ptr<std::remove_pointer_t<krb5_ccache>, CcacheDeleter>;
+
+inline core::Result<UniqueKrb5Ccache> MakeUniqueFileCcache(krb5_context ctx) {
+  if (ctx == nullptr) {
+    return core::Result<UniqueKrb5Ccache>::Err(
+        core::Status::Error(core::StatusCode::kInvalidArgument,
+                            "MakeUniqueFileCcache: ctx is null"));
+  }
+
+  krb5_ccache raw = nullptr;
+  const krb5_error_code rc = krb5_cc_new_unique(ctx, "FILE", nullptr, &raw);
+  if (rc != 0) {
+    return core::Result<UniqueKrb5Ccache>::Err(
+        Krb5ErrorStatus("krb5_cc_new_unique(FILE)", ctx, rc));
+  }
+
+  return core::Result<UniqueKrb5Ccache>::Ok(
+      UniqueKrb5Ccache(raw, CcacheDeleter{ctx, Krb5CcacheCleanupMode::kDestroy}));
+}
+
+class ScopedKrb5Data {
+ public:
+  explicit ScopedKrb5Data(krb5_context ctx) noexcept : ctx_(ctx) {}
+
+  ~ScopedKrb5Data() {
+    if (ctx_ != nullptr && data_.data != nullptr) {
+      krb5_free_data_contents(ctx_, &data_);
+    }
+  }
+
+  ScopedKrb5Data(const ScopedKrb5Data&) = delete;
+  ScopedKrb5Data& operator=(const ScopedKrb5Data&) = delete;
+
+  ScopedKrb5Data(ScopedKrb5Data&&) = delete;
+  ScopedKrb5Data& operator=(ScopedKrb5Data&&) = delete;
+
+  krb5_data* get() noexcept { return &data_; }
+  const krb5_data* get() const noexcept { return &data_; }
+
+  std::string ToString() const {
+    if (data_.data == nullptr || data_.length <= 0) {
+      return {};
+    }
+    return std::string(data_.data, static_cast<std::size_t>(data_.length));
+  }
+
+ private:
+  krb5_context ctx_ = nullptr;
+  krb5_data data_{0, 0, nullptr};
+};
+
+}  // namespace gatehouse::infra
+--------------------------------------------------
+END OF FILE: src/infra/krb5_helpers.h
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 
@@ -2938,6 +4376,7 @@ START OF FILE: src/infra/ldap_directory.cc
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <ldap.h>
 
@@ -2946,9 +4385,9 @@ namespace {
 
 core::Status LErr(const char* what, int rc) {
   const char* s = ldap_err2string(rc);
-  return core::Status::Error(core::StatusCode::kUnavailable,
-                             std::string(what) + " (ldap=" + std::to_string(rc) + "): " +
-                                 (s ? s : ""));
+  return core::Status::Error(
+      core::StatusCode::kUnavailable,
+      std::string(what) + " (ldap=" + std::to_string(rc) + "): " + (s ? s : ""));
 }
 
 std::string EscapeFilterValue(const std::string& in) {
@@ -2957,15 +4396,304 @@ std::string EscapeFilterValue(const std::string& in) {
   for (char ch : in) {
     const unsigned char c = static_cast<unsigned char>(ch);
     switch (c) {
-      case '\\': out += "\\5c"; break;
-      case '*':  out += "\\2a"; break;
-      case '(':  out += "\\28"; break;
-      case ')':  out += "\\29"; break;
-      case '\0': out += "\\00"; break;
-      default:   out.push_back(static_cast<char>(c)); break;
+      case '\\':
+        out += "\\5c";
+        break;
+      case '*':
+        out += "\\2a";
+        break;
+      case '(':
+        out += "\\28";
+        break;
+      case ')':
+        out += "\\29";
+        break;
+      case '\0':
+        out += "\\00";
+        break;
+      default:
+        out.push_back(static_cast<char>(c));
+        break;
     }
   }
   return out;
+}
+
+class LdapHandle final {
+ public:
+  LdapHandle() = default;
+  explicit LdapHandle(LDAP* ld) : ld_(ld) {}
+
+  LdapHandle(const LdapHandle&) = delete;
+  LdapHandle& operator=(const LdapHandle&) = delete;
+
+  LdapHandle(LdapHandle&& other) noexcept : ld_(other.ld_) {
+    other.ld_ = nullptr;
+  }
+
+  LdapHandle& operator=(LdapHandle&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      ld_ = other.ld_;
+      other.ld_ = nullptr;
+    }
+    return *this;
+  }
+
+  ~LdapHandle() { Reset(); }
+
+  LDAP* get() const { return ld_; }
+  explicit operator bool() const { return ld_ != nullptr; }
+
+  void Reset(LDAP* ld = nullptr) {
+    if (ld_ != nullptr) {
+      ldap_unbind_ext_s(ld_, nullptr, nullptr);
+    }
+    ld_ = ld;
+  }
+
+ private:
+  LDAP* ld_ = nullptr;
+};
+
+class LdapMessageHandle final {
+ public:
+  LdapMessageHandle() = default;
+  explicit LdapMessageHandle(LDAPMessage* msg) : msg_(msg) {}
+
+  LdapMessageHandle(const LdapMessageHandle&) = delete;
+  LdapMessageHandle& operator=(const LdapMessageHandle&) = delete;
+
+  LdapMessageHandle(LdapMessageHandle&& other) noexcept : msg_(other.msg_) {
+    other.msg_ = nullptr;
+  }
+
+  LdapMessageHandle& operator=(LdapMessageHandle&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      msg_ = other.msg_;
+      other.msg_ = nullptr;
+    }
+    return *this;
+  }
+
+  ~LdapMessageHandle() { Reset(); }
+
+  LDAPMessage* get() const { return msg_; }
+  explicit operator bool() const { return msg_ != nullptr; }
+
+  void Reset(LDAPMessage* msg = nullptr) {
+    if (msg_ != nullptr) {
+      ldap_msgfree(msg_);
+    }
+    msg_ = msg;
+  }
+
+ private:
+  LDAPMessage* msg_ = nullptr;
+};
+
+class BervalValuesHandle final {
+ public:
+  BervalValuesHandle() = default;
+  explicit BervalValuesHandle(struct berval** vals) : vals_(vals) {}
+
+  BervalValuesHandle(const BervalValuesHandle&) = delete;
+  BervalValuesHandle& operator=(const BervalValuesHandle&) = delete;
+
+  BervalValuesHandle(BervalValuesHandle&& other) noexcept : vals_(other.vals_) {
+    other.vals_ = nullptr;
+  }
+
+  BervalValuesHandle& operator=(BervalValuesHandle&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      vals_ = other.vals_;
+      other.vals_ = nullptr;
+    }
+    return *this;
+  }
+
+  ~BervalValuesHandle() { Reset(); }
+
+  struct berval** get() const { return vals_; }
+  struct berval* operator[](int index) const { return vals_[index]; }
+  explicit operator bool() const { return vals_ != nullptr; }
+
+  void Reset(struct berval** vals = nullptr) {
+    if (vals_ != nullptr) {
+      ldap_value_free_len(vals_);
+    }
+    vals_ = vals;
+  }
+
+ private:
+  struct berval** vals_ = nullptr;
+};
+
+class LdapAllocatedString final {
+ public:
+  LdapAllocatedString() = default;
+  explicit LdapAllocatedString(char* ptr) : ptr_(ptr) {}
+
+  LdapAllocatedString(const LdapAllocatedString&) = delete;
+  LdapAllocatedString& operator=(const LdapAllocatedString&) = delete;
+
+  LdapAllocatedString(LdapAllocatedString&& other) noexcept : ptr_(other.ptr_) {
+    other.ptr_ = nullptr;
+  }
+
+  LdapAllocatedString& operator=(LdapAllocatedString&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      ptr_ = other.ptr_;
+      other.ptr_ = nullptr;
+    }
+    return *this;
+  }
+
+  ~LdapAllocatedString() { Reset(); }
+
+  char* get() const { return ptr_; }
+  explicit operator bool() const { return ptr_ != nullptr; }
+
+  void Reset(char* ptr = nullptr) {
+    if (ptr_ != nullptr) {
+      ldap_memfree(ptr_);
+    }
+    ptr_ = ptr;
+  }
+
+ private:
+  char* ptr_ = nullptr;
+};
+
+bool IsLdapsUrl(const std::string& url) {
+  return url.rfind("ldaps://", 0) == 0;
+}
+
+std::string BuildUsersBase(const LdapConfig& cfg, const std::string& tenant_ou) {
+  return "cn=users,cn=accounts,ou=" + tenant_ou + "," + cfg.base_dn;
+}
+
+core::Result<LdapHandle> ConnectAndBind(const LdapConfig& cfg) {
+  if (cfg.url.empty() || cfg.bind_dn.empty() || cfg.base_dn.empty()) {
+    return core::Result<LdapHandle>::Err(core::Status::Error(
+        core::StatusCode::kFailedPrecondition,
+        "LDAP config incomplete (url/bind_dn/base_dn)"));
+  }
+
+  LDAP* raw = nullptr;
+  const int init_rc = ldap_initialize(&raw, cfg.url.c_str());
+  if (init_rc != LDAP_SUCCESS || raw == nullptr) {
+    return core::Result<LdapHandle>::Err(LErr("ldap_initialize", init_rc));
+  }
+
+  LdapHandle ld(raw);
+
+  int version = LDAP_VERSION3;
+  int rc = ldap_set_option(ld.get(), LDAP_OPT_PROTOCOL_VERSION, &version);
+  if (rc != LDAP_OPT_SUCCESS) {
+    return core::Result<LdapHandle>::Err(
+        LErr("ldap_set_option(PROTOCOL_VERSION)", rc));
+  }
+
+  struct timeval tv;
+  tv.tv_sec = cfg.network_timeout_seconds;
+  tv.tv_usec = 0;
+  rc = ldap_set_option(ld.get(), LDAP_OPT_NETWORK_TIMEOUT, &tv);
+  if (rc != LDAP_OPT_SUCCESS) {
+    return core::Result<LdapHandle>::Err(
+        LErr("ldap_set_option(NETWORK_TIMEOUT)", rc));
+  }
+
+  if (cfg.starttls && !IsLdapsUrl(cfg.url)) {
+    rc = ldap_start_tls_s(ld.get(), nullptr, nullptr);
+    if (rc != LDAP_SUCCESS) {
+      return core::Result<LdapHandle>::Err(LErr("ldap_start_tls_s", rc));
+    }
+  }
+
+  struct berval cred;
+  cred.bv_val = const_cast<char*>(cfg.bind_pw.c_str());
+  cred.bv_len = cfg.bind_pw.size();
+
+  rc = ldap_sasl_bind_s(ld.get(), cfg.bind_dn.c_str(), LDAP_SASL_SIMPLE, &cred,
+                        nullptr, nullptr, nullptr);
+  if (rc != LDAP_SUCCESS) {
+    return core::Result<LdapHandle>::Err(
+        LErr("ldap_sasl_bind_s(simple)", rc));
+  }
+
+  return core::Result<LdapHandle>::Ok(std::move(ld));
+}
+
+std::optional<std::string> GetFirstAttributeValue(LDAP* ld,
+                                                  LDAPMessage* entry,
+                                                  const char* attr) {
+  BervalValuesHandle vals(
+      ldap_get_values_len(ld, entry, const_cast<char*>(attr)));
+  if (!vals || vals[0] == nullptr || vals[0]->bv_val == nullptr) {
+    return std::nullopt;
+  }
+  return std::string(vals[0]->bv_val, vals[0]->bv_len);
+}
+
+std::vector<std::string> GetAllAttributeValues(LDAP* ld,
+                                               LDAPMessage* entry,
+                                               const char* attr) {
+  std::vector<std::string> values;
+  BervalValuesHandle vals(
+      ldap_get_values_len(ld, entry, const_cast<char*>(attr)));
+  if (!vals) {
+    return values;
+  }
+
+  for (int i = 0; vals[i] != nullptr; ++i) {
+    if (vals[i]->bv_val != nullptr) {
+      values.emplace_back(vals[i]->bv_val, vals[i]->bv_len);
+    }
+  }
+  return values;
+}
+
+std::optional<std::string> GetEntryDn(LDAP* ld, LDAPMessage* entry) {
+  LdapAllocatedString dn(ldap_get_dn(ld, entry));
+  if (!dn || dn.get() == nullptr || dn.get()[0] == '\0') {
+    return std::nullopt;
+  }
+  return std::string(dn.get());
+}
+
+core::Result<std::optional<std::string>> FindUserDnByUid(const LdapConfig& cfg,
+                                                         LDAP* ld,
+                                                         const std::string& tenant_ou,
+                                                         const std::string& uid) {
+  const std::string base = BuildUsersBase(cfg, tenant_ou);
+  const std::string filter = "(uid=" + EscapeFilterValue(uid) + ")";
+  char* attrs[] = {const_cast<char*>("1.1"), nullptr};
+
+  struct timeval tv{cfg.network_timeout_seconds, 0};
+  LDAPMessage* raw_res = nullptr;
+  int rc = ldap_search_ext_s(ld, base.c_str(), LDAP_SCOPE_SUBTREE,
+                             filter.c_str(), attrs, 0,
+                             nullptr, nullptr, &tv, 1, &raw_res);
+  LdapMessageHandle res(raw_res);
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::optional<std::string>>::Err(
+        LErr("ldap_search_ext_s(find user dn)", rc));
+  }
+
+  LDAPMessage* entry = ldap_first_entry(ld, res.get());
+  if (entry == nullptr) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+
+  return core::Result<std::optional<std::string>>::Ok(GetEntryDn(ld, entry));
 }
 
 }  // namespace
@@ -2977,100 +4705,587 @@ core::Result<std::optional<std::string>> LdapDirectory::LookupMail(
   std::fprintf(stderr, "[gatehouse][ldap] LookupMail begin tenant_ou=%s uid=%s\n",
                tenant_ou.c_str(), uid.c_str());
 
-  if (cfg_.url.empty() || cfg_.bind_dn.empty() || cfg_.base_dn.empty()) {
-    return core::Result<std::optional<std::string>>::Err(core::Status::Error(
-        core::StatusCode::kFailedPrecondition, "LDAP config incomplete (url/bind_dn/base_dn)"));
-  }
   if (tenant_ou.empty() || uid.empty()) {
     return core::Result<std::optional<std::string>>::Err(core::Status::Error(
         core::StatusCode::kInvalidArgument, "tenant_ou/uid empty"));
   }
 
-  LDAP* ld = nullptr;
-  int rc = ldap_initialize(&ld, cfg_.url.c_str());
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_initialize rc=%d ld=%p\n", rc, (void*)ld);
-  if (rc != LDAP_SUCCESS || ld == nullptr) {
-    return core::Result<std::optional<std::string>>::Err(LErr("ldap_initialize", rc));
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::optional<std::string>>::Err(ld_res.status());
   }
+  LdapHandle ld = std::move(ld_res.value());
 
-  int version = LDAP_VERSION3;
-  (void)ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &version);
-
-  struct timeval tv;
-  tv.tv_sec = cfg_.network_timeout_seconds;
-  tv.tv_usec = 0;
-  (void)ldap_set_option(ld, LDAP_OPT_NETWORK_TIMEOUT, &tv);
-
-  if (cfg_.starttls) {
-    std::fprintf(stderr, "[gatehouse][ldap] ldap_start_tls_s...\n");
-    rc = ldap_start_tls_s(ld, nullptr, nullptr);
-    std::fprintf(stderr, "[gatehouse][ldap] ldap_start_tls_s rc=%d\n", rc);
-    if (rc != LDAP_SUCCESS) {
-      ldap_unbind_ext_s(ld, nullptr, nullptr);
-      return core::Result<std::optional<std::string>>::Err(LErr("ldap_start_tls_s", rc));
-    }
-  }
-
-  // One single simple bind using SASL SIMPLE with explicit password.
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_sasl_bind_s(simple) dn=%s ...\n",
-               cfg_.bind_dn.c_str());
-  struct berval cred;
-  cred.bv_val = const_cast<char*>(cfg_.bind_pw.c_str());
-  cred.bv_len = cfg_.bind_pw.size();
-
-  rc = ldap_sasl_bind_s(ld, cfg_.bind_dn.c_str(), LDAP_SASL_SIMPLE, &cred,
-                        nullptr, nullptr, nullptr);
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_sasl_bind_s rc=%d\n", rc);
-  if (rc != LDAP_SUCCESS) {
-    ldap_unbind_ext_s(ld, nullptr, nullptr);
-    return core::Result<std::optional<std::string>>::Err(LErr("ldap_sasl_bind_s(simple)", rc));
-  }
-
-  const std::string base = "ou=people,ou=" + tenant_ou + "," + cfg_.base_dn;
+  const std::string base = BuildUsersBase(cfg_, tenant_ou);
   const std::string filter = "(uid=" + EscapeFilterValue(uid) + ")";
-  std::fprintf(stderr, "[gatehouse][ldap] search base=%s filter=%s\n", base.c_str(), filter.c_str());
-
   char* attrs[] = {const_cast<char*>("mail"), nullptr};
 
-  LDAPMessage* res = nullptr;
-  rc = ldap_search_ext_s(ld, base.c_str(), LDAP_SCOPE_SUBTREE, filter.c_str(), attrs, 0,
-                        nullptr, nullptr, &tv, 1, &res);
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_search_ext_s rc=%d res=%p\n", rc, (void*)res);
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+  LDAPMessage* raw_res = nullptr;
+  int rc = ldap_search_ext_s(ld.get(), base.c_str(), LDAP_SCOPE_SUBTREE,
+                             filter.c_str(), attrs, 0,
+                             nullptr, nullptr, &tv, 1, &raw_res);
+  LdapMessageHandle res(raw_res);
 
-  if (rc != LDAP_SUCCESS) {
-    if (res) ldap_msgfree(res);
-    ldap_unbind_ext_s(ld, nullptr, nullptr);
-    if (rc == LDAP_NO_SUCH_OBJECT) {
-      return core::Result<std::optional<std::string>>::Ok(std::nullopt);
-    }
-    return core::Result<std::optional<std::string>>::Err(LErr("ldap_search_ext_s", rc));
+  std::fprintf(stderr, "[gatehouse][ldap] ldap_search_ext_s rc=%d res=%p\n",
+               rc, static_cast<void*>(res.get()));
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::optional<std::string>>::Err(
+        LErr("ldap_search_ext_s", rc));
   }
 
-  LDAPMessage* entry = ldap_first_entry(ld, res);
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_first_entry entry=%p\n", (void*)entry);
+  LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
   if (entry == nullptr) {
-    ldap_msgfree(res);
-    ldap_unbind_ext_s(ld, nullptr, nullptr);
     return core::Result<std::optional<std::string>>::Ok(std::nullopt);
   }
 
-  // No attribute iteration: directly ask for "mail".
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_get_values_len(mail)...\n");
-  struct berval** vals = ldap_get_values_len(ld, entry, const_cast<char*>("mail"));
-  std::fprintf(stderr, "[gatehouse][ldap] ldap_get_values_len vals=%p\n", (void*)vals);
-
-  std::optional<std::string> mail;
-  if (vals != nullptr && vals[0] != nullptr && vals[0]->bv_val != nullptr) {
-    mail = std::string(vals[0]->bv_val, vals[0]->bv_len);
-  }
-  if (vals) ldap_value_free_len(vals);
-
-  ldap_msgfree(res);
-  ldap_unbind_ext_s(ld, nullptr, nullptr);
-
+  std::optional<std::string> mail =
+      GetFirstAttributeValue(ld.get(), entry, "mail");
   std::fprintf(stderr, "[gatehouse][ldap] LookupMail done mail=%s\n",
                mail.has_value() ? mail->c_str() : "(nullopt)");
-  return core::Result<std::optional<std::string>>::Ok(mail);
+  return core::Result<std::optional<std::string>>::Ok(std::move(mail));
+}
+
+core::Result<bool> LdapDirectory::IsUserInGroup(const std::string& uid,
+                                                const std::string& group_dn) const {
+  if (uid.empty() || group_dn.empty()) {
+    return core::Result<bool>::Ok(false);
+  }
+
+  // Single connection for both lookups.
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<bool>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+
+  // Step 1: Resolve the user's full DN by searching globally from base_dn.
+  // This works for both tenant users (ou=<tenant>,...) and top-level IPA users
+  // who have no ou= component in their DN.
+  std::string user_dn;
+  {
+    const std::string filter = "(uid=" + EscapeFilterValue(uid) + ")";
+    char* attrs[] = {const_cast<char*>("1.1"), nullptr};
+
+    LDAPMessage* raw_res = nullptr;
+    const int rc = ldap_search_ext_s(ld.get(), cfg_.base_dn.c_str(),
+                                     LDAP_SCOPE_SUBTREE, filter.c_str(),
+                                     attrs, 0, nullptr, nullptr, &tv, 1,
+                                     &raw_res);
+    LdapMessageHandle res(raw_res);
+
+    if (rc == LDAP_NO_SUCH_OBJECT) {
+      return core::Result<bool>::Ok(false);
+    }
+    if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+      return core::Result<bool>::Err(LErr("ldap_search_ext_s(find user for group check)", rc));
+    }
+
+    LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
+    if (entry == nullptr) {
+      return core::Result<bool>::Ok(false);
+    }
+    std::optional<std::string> dn = GetEntryDn(ld.get(), entry);
+    if (!dn.has_value() || dn->empty()) {
+      return core::Result<bool>::Ok(false);
+    }
+    user_dn = std::move(*dn);
+  }
+
+  // Step 2: Fetch the group entry and check membership.
+  {
+    char* attrs[] = {
+        const_cast<char*>("memberUid"),
+        const_cast<char*>("member"),
+        const_cast<char*>("uniqueMember"),
+        nullptr};
+
+    LDAPMessage* raw_res = nullptr;
+    const int rc = ldap_search_ext_s(ld.get(), group_dn.c_str(),
+                                     LDAP_SCOPE_BASE, "(objectClass=*)",
+                                     attrs, 0, nullptr, nullptr, &tv, 0,
+                                     &raw_res);
+    LdapMessageHandle res(raw_res);
+
+    if (rc == LDAP_NO_SUCH_OBJECT) {
+      return core::Result<bool>::Ok(false);
+    }
+    if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+      return core::Result<bool>::Err(LErr("ldap_search_ext_s(group)", rc));
+    }
+
+    LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
+    if (entry == nullptr) {
+      return core::Result<bool>::Ok(false);
+    }
+
+    // memberUid stores plain uid strings (posixGroup style).
+    {
+      BervalValuesHandle vals(
+          ldap_get_values_len(ld.get(), entry, const_cast<char*>("memberUid")));
+      if (vals) {
+        for (int i = 0; vals[i] != nullptr; ++i) {
+          std::string val(vals[i]->bv_val, vals[i]->bv_len);
+          if (val == uid) {
+            return core::Result<bool>::Ok(true);
+          }
+        }
+      }
+    }
+
+    // member and uniqueMember store full DNs.
+    for (const char* attr : {"member", "uniqueMember"}) {
+      BervalValuesHandle vals(
+          ldap_get_values_len(ld.get(), entry, const_cast<char*>(attr)));
+      if (vals) {
+        for (int i = 0; vals[i] != nullptr; ++i) {
+          std::string val(vals[i]->bv_val, vals[i]->bv_len);
+          if (val == user_dn) {
+            return core::Result<bool>::Ok(true);
+          }
+        }
+      }
+    }
+  }
+
+  return core::Result<bool>::Ok(false);
+}
+
+core::Result<void> LdapDirectory::ActivateUser(const std::string& tenant_ou,
+                                               const std::string& uid) const {
+  std::fprintf(stderr, "[gatehouse][ldap] ActivateUser begin tenant_ou=%s uid=%s\n",
+               tenant_ou.c_str(), uid.c_str());
+
+  if (tenant_ou.empty() || uid.empty()) {
+    return core::Result<void>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "tenant_ou/uid empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<void>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  auto user_dn_res = FindUserDnByUid(cfg_, ld.get(), tenant_ou, uid);
+  if (!user_dn_res.ok()) {
+    return core::Result<void>::Err(user_dn_res.status());
+  }
+  std::optional<std::string> user_dn = std::move(user_dn_res.value());
+  if (!user_dn.has_value() || user_dn->empty()) {
+    return core::Result<void>::Err(core::Status::Error(
+        core::StatusCode::kNotFound, "User not found for activation"));
+  }
+
+  std::fprintf(stderr, "[gatehouse][ldap] Unlocking DN: %s\n", user_dn->c_str());
+
+  LDAPMod mod;
+  std::memset(&mod, 0, sizeof(mod));
+  mod.mod_op = LDAP_MOD_DELETE;
+  mod.mod_type = const_cast<char*>("pwdAccountLockedTime");
+  mod.mod_values = nullptr;
+
+  LDAPMod* mods[] = {&mod, nullptr};
+
+  const int rc = ldap_modify_ext_s(ld.get(), user_dn->c_str(), mods, nullptr, nullptr);
+  if (rc != LDAP_SUCCESS && rc != LDAP_NO_SUCH_ATTRIBUTE) {
+    return core::Result<void>::Err(LErr("ldap_modify_ext_s", rc));
+  }
+
+  std::fprintf(stderr, "[gatehouse][ldap] ActivateUser success\n");
+  return core::Result<void>::Ok();
+}
+
+core::Result<std::vector<LdapDirectory::LdapUser>> LdapDirectory::ListUsers(
+    const std::string& tenant_ou) const {
+  if (tenant_ou.empty()) {
+    return core::Result<std::vector<LdapUser>>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "tenant_ou empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::vector<LdapUser>>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  const std::string base = BuildUsersBase(cfg_, tenant_ou);
+  const std::string filter = "(&(uid=*)(mail=*))";
+  char* attrs[] = {
+      const_cast<char*>("uid"),
+      const_cast<char*>("mail"),
+      const_cast<char*>("givenName"),
+      const_cast<char*>("sn"),
+      nullptr};
+
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+  LDAPMessage* raw_res = nullptr;
+  int rc = ldap_search_ext_s(ld.get(), base.c_str(), LDAP_SCOPE_SUBTREE,
+                             filter.c_str(), attrs, 0,
+                             nullptr, nullptr, &tv, 0, &raw_res);
+  LdapMessageHandle res(raw_res);
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::vector<LdapUser>>::Ok({});
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::vector<LdapUser>>::Err(
+        LErr("ldap_search_ext_s", rc));
+  }
+
+  std::vector<LdapUser> users;
+  for (LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
+       entry != nullptr;
+       entry = ldap_next_entry(ld.get(), entry)) {
+    LdapUser user;
+
+    std::optional<std::string> uid_val =
+        GetFirstAttributeValue(ld.get(), entry, "uid");
+    if (uid_val.has_value()) {
+      user.uid = std::move(*uid_val);
+    }
+
+    std::optional<std::string> mail_val =
+        GetFirstAttributeValue(ld.get(), entry, "mail");
+    if (mail_val.has_value()) {
+      user.mail = std::move(*mail_val);
+    }
+
+    std::optional<std::string> gn = GetFirstAttributeValue(ld.get(), entry, "givenName");
+    if (gn.has_value()) user.given_name = std::move(*gn);
+
+    std::optional<std::string> sn = GetFirstAttributeValue(ld.get(), entry, "sn");
+    if (sn.has_value()) user.surname = std::move(*sn);
+
+    if (!user.uid.empty() && !user.mail.empty()) {
+      users.push_back(std::move(user));
+    }
+  }
+
+  return core::Result<std::vector<LdapUser>>::Ok(std::move(users));
+}
+
+core::Result<std::vector<LdapDirectory::LdapHost>> LdapDirectory::GetUserHosts(
+    const std::string& tenant_ou, const std::string& uid) const {
+  if (tenant_ou.empty() || uid.empty()) {
+    return core::Result<std::vector<LdapHost>>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "tenant_ou/uid empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::vector<LdapHost>>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  const std::string user_base = "ou=" + tenant_ou + "," + cfg_.base_dn;
+  const std::string filter = "(uid=" + EscapeFilterValue(uid) + ")";
+  char* user_attrs[] = {const_cast<char*>("labeledURI"), nullptr};
+
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+  LDAPMessage* raw_user_res = nullptr;
+  int rc = ldap_search_ext_s(ld.get(), user_base.c_str(), LDAP_SCOPE_SUBTREE,
+                             filter.c_str(), user_attrs, 0,
+                             nullptr, nullptr, &tv, 1, &raw_user_res);
+  LdapMessageHandle user_res(raw_user_res);
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::vector<LdapHost>>::Ok({});
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::vector<LdapHost>>::Err(
+        LErr("ldap_search_ext_s (user)", rc));
+  }
+
+  LDAPMessage* user_entry = ldap_first_entry(ld.get(), user_res.get());
+  if (user_entry == nullptr) {
+    return core::Result<std::vector<LdapHost>>::Ok({});
+  }
+
+  std::vector<std::string> host_dns;
+  {
+    std::vector<std::string> uris =
+        GetAllAttributeValues(ld.get(), user_entry, "labeledURI");
+    for (const auto& uri : uris) {
+      const std::string prefix = "managed-host:";
+      if (uri.rfind(prefix, 0) == 0) {
+        host_dns.push_back(uri.substr(prefix.size()));
+      }
+    }
+  }
+
+  std::vector<LdapHost> hosts;
+  char* host_attrs[] = {
+      const_cast<char*>("cn"),
+      const_cast<char*>("ipHostNumber"),
+      const_cast<char*>("aRecord"),
+      nullptr};
+
+  for (const auto& host_dn : host_dns) {
+    LDAPMessage* raw_host_res = nullptr;
+    rc = ldap_search_ext_s(ld.get(), host_dn.c_str(), LDAP_SCOPE_BASE,
+                           "(objectClass=*)", host_attrs, 0,
+                           nullptr, nullptr, &tv, 1, &raw_host_res);
+    LdapMessageHandle host_res(raw_host_res);
+
+    if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+      continue;
+    }
+
+    LDAPMessage* host_entry = ldap_first_entry(ld.get(), host_res.get());
+    if (host_entry == nullptr) {
+      continue;
+    }
+
+    LdapHost host;
+    host.dn = host_dn;
+
+    std::optional<std::string> cn_val =
+        GetFirstAttributeValue(ld.get(), host_entry, "cn");
+    if (cn_val.has_value()) {
+      host.hostname = std::move(*cn_val);
+    }
+
+    std::optional<std::string> ip_val =
+        GetFirstAttributeValue(ld.get(), host_entry, "ipHostNumber");
+    if (!ip_val.has_value()) {
+      ip_val = GetFirstAttributeValue(ld.get(), host_entry, "aRecord");
+    }
+    if (ip_val.has_value()) {
+      host.ip = std::move(*ip_val);
+    }
+
+    hosts.push_back(std::move(host));
+  }
+
+  return core::Result<std::vector<LdapHost>>::Ok(std::move(hosts));
+}
+
+core::Result<std::optional<std::string>> LdapDirectory::GetUserDn(
+    const std::string& tenant_ou, const std::string& uid) const {
+  if (tenant_ou.empty() || uid.empty()) {
+    return core::Result<std::optional<std::string>>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "tenant_ou/uid empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::optional<std::string>>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  return FindUserDnByUid(cfg_, ld.get(), tenant_ou, uid);
+}
+
+core::Result<std::optional<std::string>> LdapDirectory::ResolveTenantByUid(
+    const std::string& uid) const {
+  if (uid.empty()) {
+    return core::Result<std::optional<std::string>>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "uid empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::optional<std::string>>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  const std::string filter = "(uid=" + EscapeFilterValue(uid) + ")";
+  char* attrs[] = {const_cast<char*>("1.1"), nullptr};
+
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+  LDAPMessage* raw_res = nullptr;
+  const int rc = ldap_search_ext_s(ld.get(), cfg_.base_dn.c_str(), LDAP_SCOPE_SUBTREE,
+                                   filter.c_str(), attrs, 0,
+                                   nullptr, nullptr, &tv, 1, &raw_res);
+  LdapMessageHandle res(raw_res);
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::optional<std::string>>::Err(
+        LErr("ldap_search_ext_s (resolve tenant)", rc));
+  }
+
+  LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
+  if (entry == nullptr) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+
+  std::optional<std::string> dn = GetEntryDn(ld.get(), entry);
+  if (!dn.has_value()) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+
+  const std::string needle = ",ou=";
+  std::size_t pos = dn->find(needle);
+  if (pos == std::string::npos) {
+    return core::Result<std::optional<std::string>>::Ok(std::nullopt);
+  }
+
+  pos += needle.size();
+  std::size_t end = dn->find(',', pos);
+  if (end == std::string::npos) {
+    end = dn->size();
+  }
+
+  return core::Result<std::optional<std::string>>::Ok(
+      dn->substr(pos, end - pos));
+}
+
+
+core::Result<std::vector<std::string>> LdapDirectory::ListTenants() const {
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::vector<std::string>>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  char* attrs[] = {const_cast<char*>("ou"), nullptr};
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+  LDAPMessage* raw_res = nullptr;
+  const int rc = ldap_search_ext_s(ld.get(), cfg_.base_dn.c_str(), LDAP_SCOPE_ONELEVEL,
+                                   "(objectClass=organizationalUnit)", attrs, 0,
+                                   nullptr, nullptr, &tv, 0, &raw_res);
+  LdapMessageHandle res(raw_res);
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::vector<std::string>>::Ok({});
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::vector<std::string>>::Err(LErr("ldap_search_ext_s(tenants)", rc));
+  }
+
+  std::vector<std::string> tenants;
+  for (LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
+       entry != nullptr;
+       entry = ldap_next_entry(ld.get(), entry)) {
+    std::optional<std::string> ou = GetFirstAttributeValue(ld.get(), entry, "ou");
+    if (ou.has_value() && !ou->empty()) {
+      tenants.push_back(std::move(*ou));
+    }
+  }
+  return core::Result<std::vector<std::string>>::Ok(std::move(tenants));
+}
+
+core::Result<std::vector<LdapDirectory::LdapUserDetail>> LdapDirectory::ListUsersWithHosts(
+    const std::string& tenant_ou) const {
+  if (tenant_ou.empty()) {
+    return core::Result<std::vector<LdapUserDetail>>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "tenant_ou empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) {
+    return core::Result<std::vector<LdapUserDetail>>::Err(ld_res.status());
+  }
+  LdapHandle ld = std::move(ld_res.value());
+
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+
+  // Step 1: fetch all users in the tenant with extended attributes.
+  const std::string user_base = BuildUsersBase(cfg_, tenant_ou);
+  char* user_attrs[] = {
+      const_cast<char*>("uid"),
+      const_cast<char*>("mail"),
+      const_cast<char*>("givenName"),
+      const_cast<char*>("sn"),
+      const_cast<char*>("labeledURI"),
+      nullptr};
+
+  LDAPMessage* raw_user_res = nullptr;
+  int rc = ldap_search_ext_s(ld.get(), user_base.c_str(), LDAP_SCOPE_SUBTREE,
+                             "(&(uid=*)(mail=*))", user_attrs, 0,
+                             nullptr, nullptr, &tv, 0, &raw_user_res);
+  LdapMessageHandle user_res(raw_user_res);
+
+  if (rc == LDAP_NO_SUCH_OBJECT) {
+    return core::Result<std::vector<LdapUserDetail>>::Ok({});
+  }
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<std::vector<LdapUserDetail>>::Err(
+        LErr("ldap_search_ext_s(users with hosts)", rc));
+  }
+
+  // Step 2: build user list and collect all unique host DNs.
+  std::vector<LdapUserDetail> users;
+  // Per user: which host DNs does it reference?
+  std::vector<std::vector<std::string>> user_host_dns;
+
+  for (LDAPMessage* entry = ldap_first_entry(ld.get(), user_res.get());
+       entry != nullptr;
+       entry = ldap_next_entry(ld.get(), entry)) {
+    LdapUserDetail u;
+
+    std::optional<std::string> uid_v = GetFirstAttributeValue(ld.get(), entry, "uid");
+    if (!uid_v.has_value() || uid_v->empty()) continue;
+    u.uid = std::move(*uid_v);
+
+    std::optional<std::string> mail_v = GetFirstAttributeValue(ld.get(), entry, "mail");
+    if (mail_v.has_value()) u.mail = std::move(*mail_v);
+
+    std::optional<std::string> gn = GetFirstAttributeValue(ld.get(), entry, "givenName");
+    if (gn.has_value()) u.given_name = std::move(*gn);
+
+    std::optional<std::string> sn = GetFirstAttributeValue(ld.get(), entry, "sn");
+    if (sn.has_value()) u.surname = std::move(*sn);
+
+    // Collect managed-host: URIs.
+    std::vector<std::string> host_dns;
+    std::vector<std::string> uris = GetAllAttributeValues(ld.get(), entry, "labeledURI");
+    const std::string prefix = "managed-host:";
+    for (const auto& uri : uris) {
+      if (uri.rfind(prefix, 0) == 0) {
+        host_dns.push_back(uri.substr(prefix.size()));
+      }
+    }
+
+    users.push_back(std::move(u));
+    user_host_dns.push_back(std::move(host_dns));
+  }
+
+  // Step 3: resolve host DNs in the same connection.
+  char* host_attrs[] = {
+      const_cast<char*>("cn"),
+      const_cast<char*>("ipHostNumber"),
+      const_cast<char*>("aRecord"),
+      nullptr};
+
+  for (std::size_t i = 0; i < users.size(); ++i) {
+    for (const auto& host_dn : user_host_dns[i]) {
+      LDAPMessage* raw_host = nullptr;
+      rc = ldap_search_ext_s(ld.get(), host_dn.c_str(), LDAP_SCOPE_BASE,
+                             "(objectClass=*)", host_attrs, 0,
+                             nullptr, nullptr, &tv, 1, &raw_host);
+      LdapMessageHandle host_res(raw_host);
+
+      if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) continue;
+
+      LDAPMessage* host_entry = ldap_first_entry(ld.get(), host_res.get());
+      if (host_entry == nullptr) continue;
+
+      LdapHost host;
+      host.dn = host_dn;
+
+      std::optional<std::string> cn = GetFirstAttributeValue(ld.get(), host_entry, "cn");
+      if (cn.has_value()) host.hostname = std::move(*cn);
+
+      std::optional<std::string> ip = GetFirstAttributeValue(ld.get(), host_entry, "ipHostNumber");
+      if (!ip.has_value()) ip = GetFirstAttributeValue(ld.get(), host_entry, "aRecord");
+      if (ip.has_value()) host.ip = std::move(*ip);
+
+      users[i].hosts.push_back(std::move(host));
+    }
+  }
+
+  return core::Result<std::vector<LdapUserDetail>>::Ok(std::move(users));
 }
 
 }  // namespace gatehouse::infra
@@ -3338,12 +5553,25 @@ core::Status MakeStmtStatus(int rc, sqlite3* db, const char* what) {
                             std::string(what) + " (rc=" + std::to_string(rc) + "): " + msg);
 }
 
+std::string BlobToHex(const void* data, int size) {
+  const auto* bytes = static_cast<const std::uint8_t*>(data);
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(static_cast<std::size_t>(size) * 2);
+  for (int i = 0; i < size; ++i) {
+    out += kHex[bytes[i] >> 4];
+    out += kHex[bytes[i] & 0xf];
+  }
+  return out;
+}
+
 }  // namespace
 
 SessionRepo::SessionRepo(SqliteDb& db) : db_(db) {}
 
 core::Result<void> SessionRepo::Insert(const SessionRow& row,
-                                      const std::vector<std::uint8_t>& csrf_secret) {
+                                      const std::vector<std::uint8_t>& csrf_secret,
+                                      const std::vector<std::uint8_t>& ip_hash) {
   sqlite3* dbh = db_.handle();
   if (dbh == nullptr) {
     return core::Result<void>::Err(
@@ -3352,8 +5580,8 @@ core::Result<void> SessionRepo::Insert(const SessionRow& row,
 
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
-      "INSERT INTO auth_session(sid,uid,tenant_id,created_at,expires_at,mfa_state,csrf_secret,ticket_id)"
-      " VALUES(?,?,?,?,?,?,?,?);";
+      "INSERT INTO auth_session(sid,uid,tenant_id,created_at,expires_at,mfa_state,csrf_secret,ticket_id,ip_hash)"
+      " VALUES(?,?,?,?,?,?,?,?,?);";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) return core::Result<void>::Err(MakeStmtStatus(rc, dbh, "prepare(insert)"));
 
@@ -3369,6 +5597,12 @@ core::Result<void> SessionRepo::Insert(const SessionRow& row,
     (void)sqlite3_bind_null(stmt, 8);
   } else {
     (void)sqlite3_bind_text(stmt, 8, row.ticket_id.c_str(), -1, SQLITE_TRANSIENT);
+  }
+  if (ip_hash.empty()) {
+    (void)sqlite3_bind_null(stmt, 9);
+  } else {
+    (void)sqlite3_bind_blob(stmt, 9, ip_hash.data(),
+                            static_cast<int>(ip_hash.size()), SQLITE_TRANSIENT);
   }
 
   rc = sqlite3_step(stmt);
@@ -3387,8 +5621,9 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
 
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
-      "SELECT sid,uid,tenant_id,created_at,expires_at,mfa_state,COALESCE(ticket_id,'') "
-      "FROM auth_session WHERE sid=?;";
+      "SELECT sid,uid,tenant_id,created_at,expires_at,mfa_state,COALESCE(ticket_id,''),"
+      "csrf_secret,ip_hash "
+      "FROM auth_session WHERE sid=?";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
     return core::Result<std::optional<SessionRow>>::Err(MakeStmtStatus(rc, dbh, "prepare(get)"));
@@ -3406,6 +5641,16 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
     row.expires_at = sqlite3_column_int64(stmt, 4);
     row.mfa_state = sqlite3_column_int(stmt, 5);
     row.ticket_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+    const void* csrf_blob = sqlite3_column_blob(stmt, 7);
+    const int csrf_size = sqlite3_column_bytes(stmt, 7);
+    if (csrf_blob != nullptr && csrf_size > 0) {
+      row.csrf_secret_hex = BlobToHex(csrf_blob, csrf_size);
+    }
+    const void* ip_blob = sqlite3_column_blob(stmt, 8);
+    const int ip_size = sqlite3_column_bytes(stmt, 8);
+    if (ip_blob != nullptr && ip_size > 0) {
+      row.ip_hash_hex = BlobToHex(ip_blob, ip_size);
+    }
     sqlite3_finalize(stmt);
     return core::Result<std::optional<SessionRow>>::Ok(std::optional<SessionRow>(std::move(row)));
   }
@@ -3740,6 +5985,7 @@ START OF FILE: src/infra/xrdp_otp_repo.cc
 #include <utility>
 #include <vector>
 
+#include <openssl/crypto.h>
 #include <sqlite3.h>
 
 namespace gatehouse::infra {
@@ -3806,12 +6052,12 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   auto tx = db_.Exec("BEGIN IMMEDIATE;");
   if (!tx.ok()) return core::Result<bool>::Err(tx.status());
 
-  // 1) Find matching, unconsumed, unexpired OTP, attempts < max_attempts
   sqlite3_stmt* sel = nullptr;
+  // Auch hier: Kein Filter mehr nach otp_hash
   const char* sel_sql =
-      "SELECT xrdp_otp_id, attempts, max_attempts FROM xrdp_otp "
-      "WHERE uid=? AND host_id=? AND otp_hash=? AND consumed_at IS NULL AND expires_at>? "
-      "LIMIT 1;";
+      "SELECT xrdp_otp_id, attempts, max_attempts, expires_at, otp_hash FROM xrdp_otp "
+      "WHERE uid=? AND host_id=? AND consumed_at IS NULL "
+      "ORDER BY issued_at DESC LIMIT 1;";
   int rc = sqlite3_prepare_v2(dbh, sel_sql, -1, &sel, nullptr);
   if (rc != SQLITE_OK) {
     (void)db_.Exec("ROLLBACK;");
@@ -3820,9 +6066,6 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
 
   (void)sqlite3_bind_text(sel, 1, uid.c_str(), -1, SQLITE_TRANSIENT);
   (void)sqlite3_bind_text(sel, 2, host_id.c_str(), -1, SQLITE_TRANSIENT);
-  (void)sqlite3_bind_blob(sel, 3, otp_hash.data(),
-                          static_cast<int>(otp_hash.size()), SQLITE_TRANSIENT);
-  (void)sqlite3_bind_int64(sel, 4, now);
 
   rc = sqlite3_step(sel);
   if (rc != SQLITE_ROW) {
@@ -3835,25 +6078,39 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   const std::string otp_id = reinterpret_cast<const char*>(sqlite3_column_text(sel, 0));
   const int attempts = sqlite3_column_int(sel, 1);
   const int max_attempts = sqlite3_column_int(sel, 2);
+  const std::int64_t expires_at = sqlite3_column_int64(sel, 3);
+  
+  const void* blob_ptr = sqlite3_column_blob(sel, 4);
+  const int blob_bytes = sqlite3_column_bytes(sel, 4);
+  std::vector<std::uint8_t> db_hash;
+  if (blob_ptr && blob_bytes > 0) {
+    const auto* b = static_cast<const std::uint8_t*>(blob_ptr);
+    db_hash.assign(b, b + blob_bytes);
+  }
   sqlite3_finalize(sel);
 
-  if (attempts >= max_attempts) {
+  if (expires_at <= now || attempts >= max_attempts) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Ok(false);
   }
 
-  // 2) Consume it (and increment attempts just for tracking).
+  // Constant-time comparison to prevent timing attacks.
+  const bool matched = (db_hash.size() == otp_hash.size() && !db_hash.empty() &&
+                        CRYPTO_memcmp(db_hash.data(), otp_hash.data(), db_hash.size()) == 0);
+
   sqlite3_stmt* upd = nullptr;
   const char* upd_sql =
-      "UPDATE xrdp_otp SET consumed_at=?, attempts=attempts+1 "
-      "WHERE xrdp_otp_id=? AND consumed_at IS NULL;";
+      "UPDATE xrdp_otp SET attempts = attempts + 1, "
+      "consumed_at = CASE WHEN ? THEN ? ELSE consumed_at END "
+      "WHERE xrdp_otp_id = ?;";
   rc = sqlite3_prepare_v2(dbh, upd_sql, -1, &upd, nullptr);
   if (rc != SQLITE_OK) {
     (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "prepare(update)"));
   }
-  (void)sqlite3_bind_int64(upd, 1, now);
-  (void)sqlite3_bind_text(upd, 2, otp_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_int(upd, 1, matched ? 1 : 0);
+  (void)sqlite3_bind_int64(upd, 2, now);
+  (void)sqlite3_bind_text(upd, 3, otp_id.c_str(), -1, SQLITE_TRANSIENT);
 
   rc = sqlite3_step(upd);
   sqlite3_finalize(upd);
@@ -3865,7 +6122,7 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   auto cm = db_.Exec("COMMIT;");
   if (!cm.ok()) return core::Result<bool>::Err(cm.status());
 
-  return core::Result<bool>::Ok(true);
+  return core::Result<bool>::Ok(matched);
 }
 
 }  // namespace gatehouse::infra
@@ -3896,9 +6153,9 @@ void PrintUsage(const char* argv0) {
       << "Usage: " << argv0
       << " [--bind ADDR] [--port PORT] [--threads N] [--db PATH]\n"
       << "       [--session-ttl SECONDS] [--cookie NAME]\n"
-      << "       [--auth demo|krb5] [--realm REALM] [--allow-demo-fallback]\n"
+      << "       [--realm REALM]\n"
       << "       [--public-base-url URL] [--invite-ttl SECONDS]\n"
-      << "       [--admin-uids CSV] [--email-backend console|curl]\n"
+      << "       [--admin-uids CSV] [--ldap-admin-group DN] [--email-backend console|curl]\n"
       << "       [--ldap-url URL] [--ldap-bind-dn DN] [--ldap-bind-pw PW]\n"
       << "       [--ldap-base-dn DN] [--ldap-starttls]\n"
       << "       [--ldif PATH]  (fallback)\n";
@@ -3971,15 +6228,7 @@ int main(int argc, char** argv) {
       cfg.session_ttl_seconds = ttl; continue;
     }
     if (arg == "--cookie" && i + 1 < argc) { cfg.session_cookie_name = argv[++i]; continue; }
-    if (arg == "--auth" && i + 1 < argc) {
-      const std::string v = argv[++i];
-      if (v == "demo") cfg.auth_cfg.mode = gatehouse::app::AuthMode::kDemo;
-      else if (v == "krb5") cfg.auth_cfg.mode = gatehouse::app::AuthMode::kKrb5;
-      else { std::cerr << "Invalid --auth\n"; return 2; }
-      continue;
-    }
     if (arg == "--realm" && i + 1 < argc) { cfg.auth_cfg.krb5_realm = argv[++i]; continue; }
-    if (arg == "--allow-demo-fallback") { cfg.auth_cfg.allow_demo_fallback = true; continue; }
 
     if (arg == "--public-base-url" && i + 1 < argc) { cfg.public_base_url = argv[++i]; continue; }
     if (arg == "--invite-ttl" && i + 1 < argc) {
@@ -3988,6 +6237,7 @@ int main(int argc, char** argv) {
       cfg.invite_ttl_seconds = ttl; continue;
     }
     if (arg == "--admin-uids" && i + 1 < argc) { cfg.admin_uids = SplitCsv(argv[++i]); continue; }
+    if (arg == "--ldap-admin-group" && i + 1 < argc) { cfg.ldap_admin_group = argv[++i]; continue; }
     if (arg == "--email-backend" && i + 1 < argc) { cfg.email_backend = argv[++i]; continue; }
 
     // LDAP
@@ -4043,14 +6293,12 @@ START OF FILE: include/app/auth.h
 namespace gatehouse::app {
 
 enum class AuthMode {
-  kDemo = 0,
   kKrb5 = 1,
 };
 
 struct AuthConfig {
-  AuthMode mode{AuthMode::kDemo};
+  AuthMode mode{AuthMode::kKrb5};
   std::string krb5_realm;
-  bool allow_demo_fallback{false};
 };
 
 struct LoginRequest {
@@ -4205,6 +6453,7 @@ struct HttpServerConfig {
   std::string public_base_url{"http://127.0.0.1:18080"};
   std::int64_t invite_ttl_seconds{7 * 24 * 60 * 60};
   std::vector<std::string> admin_uids{"demo"};
+  std::string ldap_admin_group;
 
   // Email backends: "console" (default) | "curl"
   std::string email_backend{"console"};
@@ -4608,6 +6857,8 @@ class InviteOtpRepo final {
   [[nodiscard]] core::Result<void> DeleteBySid(const std::string& sid);
 
   // Checks if there is a consumed OTP for sid (i.e., step-up verified)
+  [[nodiscard]] core::Result<std::optional<std::int64_t>> GetLastIssuedAt(const std::string& sid);
+
   [[nodiscard]] core::Result<bool> IsVerified(const std::string& sid);
 
  private:
@@ -4678,10 +6929,23 @@ class InviteRepo final {
 
   [[nodiscard]] core::Result<void> Revoke(const std::string& invite_id, std::int64_t now);
 
-  // List newest invites, optionally filtered by tenant_id and/or invited_uid.
+  // Revoke all non-completed, non-revoked invites for tenant+uid (used before re-invite).
+  [[nodiscard]] core::Result<void> RevokePending(const std::string& tenant_id,
+                                                 const std::string& uid,
+                                                 std::int64_t now);
+
+  // Returns UIDs that have an active (non-expired, non-revoked) or completed invite.
+  [[nodiscard]] core::Result<std::vector<std::string>> GetInvitedUids(const std::string& tenant_id,
+                                                                       std::int64_t now);
+
   [[nodiscard]] core::Result<std::vector<InviteRow>> ListLatest(std::int32_t limit,
                                                                 const std::string& tenant_id,
                                                                 const std::string& invited_uid);
+
+  // Returns the most recent invite per uid for the given tenant.
+  // Result is one InviteRow per uid (the latest by created_at).
+  [[nodiscard]] core::Result<std::vector<InviteRow>> GetLatestPerUid(
+      const std::string& tenant_id);
 
  private:
   SqliteDb& db_;
@@ -4759,6 +7023,43 @@ END OF FILE: include/infra/invite_session_repo.h
 
 
 vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+START OF FILE: include/infra/kadm5_client.h
+--------------------------------------------------
+#pragma once
+
+#include <string>
+#include "core/result.h"
+
+namespace gatehouse::infra {
+
+struct Kadm5Config {
+  std::string realm;
+  std::string admin_principal;
+  std::string admin_password;
+  std::string admin_server; // optional
+};
+
+class Kadm5Client final {
+ public:
+  explicit Kadm5Client(Kadm5Config cfg);
+
+  [[nodiscard]] core::Result<void> CreatePrincipal(
+      const std::string& new_principal,
+      const std::string& new_password,
+      const std::string& ldap_dn) const;
+
+ private:
+  Kadm5Config cfg_;
+};
+
+}  // namespace gatehouse::infra
+
+--------------------------------------------------
+END OF FILE: include/infra/kadm5_client.h
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
 START OF FILE: include/infra/krb5_client.h
 --------------------------------------------------
 #pragma once
@@ -4789,7 +7090,11 @@ class Krb5Client final {
   [[nodiscard]] core::Result<Krb5VerifyResult> VerifyPasswordAndGetCcache(
       const std::string& username, const std::string& password) const;
 
+  // Changes the password via kadmin/changepw
+  [[nodiscard]] core::Result<void> ChangePassword(const std::string& username, const std::string& old_password, const std::string& new_password) const;
+
  private:
+
   [[nodiscard]] std::string MakePrincipal(const std::string& username) const;
 
   Krb5Config cfg_;
@@ -4809,36 +7114,106 @@ START OF FILE: include/infra/ldap_directory.h
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/result.h"
 
 namespace gatehouse::infra {
 
 struct LdapConfig {
-  std::string url;        // e.g. "ldaps://ldap.example:636" or "ldap://...:389"
-  std::string bind_dn;    // e.g. "cn=admin,dc=catuno,dc=lab"
-  std::string bind_pw;    // secret
-  std::string base_dn;    // e.g. "dc=catuno,dc=lab"
-  bool starttls{false};   // only for ldap:// (ignored for ldaps://)
+  // Examples:
+  //   ldaps://ldap.example:636
+  //   ldap://ldap.example:389
+  std::string url;
+
+  // Example:
+  //   uid=svc-bind,cn=users,cn=accounts,dc=catuno,dc=lab
+  std::string bind_dn;
+
+  // LDAP bind password / secret.
+  std::string bind_pw;
+
+  // Example:
+  //   dc=catuno,dc=lab
+  std::string base_dn;
+
+  // Only used for ldap:// connections.
+  // Ignored for ldaps://.
+  bool starttls{false};
+
   int network_timeout_seconds{5};
 };
 
 class LdapDirectory final {
  public:
+  struct LdapUser {
+    std::string uid;
+    std::string mail;
+    std::string given_name;
+    std::string surname;
+  };
+
+  struct LdapHost {
+    std::string dn;
+    std::string hostname;
+    std::string ip;
+  };
+
+  struct LdapUserDetail {
+    std::string uid;
+    std::string mail;
+    std::string given_name;
+    std::string surname;
+    std::vector<LdapHost> hosts;
+  };
+
   explicit LdapDirectory(LdapConfig cfg);
 
-  // Lookup mail by tenant OU + uid:
-  // base = "ou=people,ou=<tenant_ou>,<base_dn>"
-  // filter = "(uid=<uid>)"
-  [[nodiscard]] core::Result<std::optional<std::string>> LookupMail(const std::string& tenant_ou,
-                                                                    const std::string& uid) const;
+  // Resolve the user's mail attribute below:
+  //   cn=users,cn=accounts,ou=<tenant_ou>,<base_dn>
+  [[nodiscard]] core::Result<std::optional<std::string>> LookupMail(
+      const std::string& tenant_ou, const std::string& uid) const;
+
+  // Check whether a user is a member of the given group DN.
+  // Supports memberUid, member and uniqueMember semantics.
+  [[nodiscard]] core::Result<bool> IsUserInGroup(
+      const std::string& uid, const std::string& group_dn) const;
+
+  // Resolve a user's LDAP DN below:
+  //   cn=users,cn=accounts,ou=<tenant_ou>,<base_dn>
+  [[nodiscard]] core::Result<std::optional<std::string>> GetUserDn(
+      const std::string& tenant_ou, const std::string& uid) const;
+
+  // Resolve the tenant OU by searching the configured base DN for uid=<uid>.
+  [[nodiscard]] core::Result<std::optional<std::string>> ResolveTenantByUid(
+      const std::string& uid) const;
+
+  // Unlock the user, e.g. by deleting pwdAccountLockedTime.
+  [[nodiscard]] core::Result<void> ActivateUser(
+      const std::string& tenant_ou, const std::string& uid) const;
+
+  // List tenant OUs directly under base_dn.
+  [[nodiscard]] core::Result<std::vector<std::string>> ListTenants() const;
+
+  // List users below:
+  //   cn=users,cn=accounts,ou=<tenant_ou>,<base_dn>
+  [[nodiscard]] core::Result<std::vector<LdapUser>> ListUsers(
+      const std::string& tenant_ou) const;
+
+  // Read managed hosts from the user's labeledURI values and dereference them.
+  [[nodiscard]] core::Result<std::vector<LdapHost>> GetUserHosts(
+      const std::string& tenant_ou, const std::string& uid) const;
+
+  // Returns all users in the tenant with full details (uid, givenName, sn, mail)
+  // and their managed hosts. Uses a single LDAP connection.
+  [[nodiscard]] core::Result<std::vector<LdapUserDetail>> ListUsersWithHosts(
+      const std::string& tenant_ou) const;
 
  private:
   LdapConfig cfg_;
 };
 
 }  // namespace gatehouse::infra
-
 --------------------------------------------------
 END OF FILE: include/infra/ldap_directory.h
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -4935,7 +7310,9 @@ struct SessionRow {
   std::int32_t mfa_state{0};
 
   // New in schema v2
-  std::string ticket_id;  // may be empty (demo mode)
+  std::string ticket_id;       // may be empty (demo mode)
+  std::string csrf_secret_hex; // hex-encoded 32-byte CSRF secret (populated by GetBySid)
+  std::string ip_hash_hex;     // hex-encoded SHA256 of client IP at login (populated by GetBySid)
 };
 
 class SessionRepo final {
@@ -4943,7 +7320,8 @@ class SessionRepo final {
   explicit SessionRepo(SqliteDb& db);
 
   [[nodiscard]] core::Result<void> Insert(const SessionRow& row,
-                                         const std::vector<std::uint8_t>& csrf_secret);
+                                         const std::vector<std::uint8_t>& csrf_secret,
+                                         const std::vector<std::uint8_t>& ip_hash = {});
 
   [[nodiscard]] core::Result<std::optional<SessionRow>> GetBySid(const std::string& sid);
 

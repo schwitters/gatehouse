@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+enable_testing()
 
 project(gatehouse LANGUAGES CXX)
 set(CMAKE_VERBOSE_MAKEFILE ON)
@@ -143,10 +144,10 @@ message(STATUS    "Includes:   ${COM_ERR_INCLUDE_DIRS}")
 # MIT Kerberos (pkg-config)
 target_include_directories(gatehouse SYSTEM PRIVATE ${KRB5_INCLUDE_DIRS} ${KADM5_INCLUDE_DIRS} ${COM_ERR_INCLUDE_DIRS})
 target_link_directories(gatehouse PRIVATE ${KRB5_LIBRARY_DIRS} ${KADM5_LIBRARY_DIRS})
-target_link_libraries(gatehouse PRIVATE 
-   ${KRB5_LIBRARIES} 
-   ${KADM5_LIBRARIES} 
-   /lib/x86_64-linux-gnu/libcom_err.so
+target_link_libraries(gatehouse PRIVATE
+   ${KRB5_LIBRARIES}
+   ${KADM5_LIBRARIES}
+   ${COM_ERR_LIBRARIES}
 )
 target_link_options(gatehouse PRIVATE -Wl,--no-as-needed -lcom_err)
 target_compile_options(gatehouse PRIVATE ${KRB5_CFLAGS_OTHER})
@@ -159,3 +160,52 @@ target_link_directories(gatehouse PRIVATE ${LDAP_LIBRARY_DIRS})
 target_link_libraries(gatehouse PRIVATE ${LDAP_LIBRARIES})
 target_compile_options(gatehouse PRIVATE ${LDAP_CFLAGS_OTHER})
 target_link_libraries(gatehouse PRIVATE CURL::libcurl)
+
+# ----------------------------
+# Core static library (no I/O, no Kerberos/LDAP — for unit tests)
+# ----------------------------
+add_library(gatehouse_core_lib STATIC
+  src/core/crypto_aead.cc
+  src/core/hex.cc
+  src/core/random.cc
+  src/core/sha256.cc
+  src/core/time.cc
+  src/core/url.cc
+)
+target_include_directories(gatehouse_core_lib PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(gatehouse_core_lib
+  PUBLIC  OpenSSL::Crypto
+  PRIVATE gatehouse_warnings
+)
+
+# ----------------------------
+# Google Test (fetched at configure time)
+# ----------------------------
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG v1.14.0
+)
+FetchContent_MakeAvailable(googletest)
+
+# ----------------------------
+# Unit test executable
+# ----------------------------
+add_executable(gatehouse_tests
+  tests/core_result_test.cc
+  tests/core_hex_test.cc
+  tests/core_sha256_test.cc
+  tests/core_url_test.cc
+  tests/core_aead_test.cc
+  tests/core_random_test.cc
+)
+target_link_libraries(gatehouse_tests PRIVATE
+  gatehouse_core_lib
+  GTest::gtest_main
+  gatehouse_warnings
+)
+include(GoogleTest)
+gtest_discover_tests(gatehouse_tests)

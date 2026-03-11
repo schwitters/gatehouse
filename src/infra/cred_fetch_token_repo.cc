@@ -93,8 +93,12 @@ core::Result<std::optional<std::string>> CredFetchTokenRepo::VerifyAndConsume(
     return core::Result<std::optional<std::string>>::Err(StmtErr(rc, dbh, "step(select)"));
   }
 
-  const std::string cft_id = reinterpret_cast<const char*>(sqlite3_column_text(sel, 0));
-  const std::string ticket_id = reinterpret_cast<const char*>(sqlite3_column_text(sel, 1));
+  auto safe_col_text = [](sqlite3_stmt* s, int col) -> std::string {
+    const auto* t = sqlite3_column_text(s, col);
+    return t ? reinterpret_cast<const char*>(t) : "";
+  };
+  const std::string cft_id = safe_col_text(sel, 0);
+  const std::string ticket_id = safe_col_text(sel, 1);
   sqlite3_finalize(sel);
 
   sqlite3_stmt* upd = nullptr;

@@ -80,6 +80,17 @@ class LdapDirectory final {
   [[nodiscard]] core::Result<void> ActivateUser(
       const std::string& tenant_ou, const std::string& uid) const;
 
+  // Check if the user has any Kerberos principal attributes in LDAP.
+  // Checks: krbExtraData, krbLastPwdChange, krbLoginFailedCount, krbPrincipalKey, krbPrincipalName.
+  [[nodiscard]] core::Result<bool> HasKrbAttributes(
+      const std::string& tenant_ou, const std::string& uid) const;
+
+  // Delete Kerberos principal attributes from the user's LDAP entry.
+  // Attributes: krbExtraData, krbLastPwdChange, krbLoginFailedCount, krbPrincipalKey, krbPrincipalName.
+  // Tolerates missing attributes (LDAP_NO_SUCH_ATTRIBUTE).
+  [[nodiscard]] core::Result<void> DeleteKrbAttributes(
+      const std::string& tenant_ou, const std::string& uid) const;
+
   // List tenant OUs directly under base_dn.
   [[nodiscard]] core::Result<std::vector<std::string>> ListTenants() const;
 

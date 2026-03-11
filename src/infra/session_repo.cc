@@ -95,16 +95,21 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
 
   (void)sqlite3_bind_text(stmt, 1, sid.c_str(), -1, SQLITE_TRANSIENT);
 
+  auto safe_col_text = [](sqlite3_stmt* s, int col) -> std::string {
+    const auto* t = sqlite3_column_text(s, col);
+    return t ? reinterpret_cast<const char*>(t) : "";
+  };
+
   rc = sqlite3_step(stmt);
   if (rc == SQLITE_ROW) {
     SessionRow row;
-    row.sid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    row.uid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    row.tenant_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+    row.sid       = safe_col_text(stmt, 0);
+    row.uid       = safe_col_text(stmt, 1);
+    row.tenant_id = safe_col_text(stmt, 2);
     row.created_at = sqlite3_column_int64(stmt, 3);
     row.expires_at = sqlite3_column_int64(stmt, 4);
-    row.mfa_state = sqlite3_column_int(stmt, 5);
-    row.ticket_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+    row.mfa_state  = sqlite3_column_int(stmt, 5);
+    row.ticket_id  = safe_col_text(stmt, 6);
     const void* csrf_blob = sqlite3_column_blob(stmt, 7);
     const int csrf_size = sqlite3_column_bytes(stmt, 7);
     if (csrf_blob != nullptr && csrf_size > 0) {

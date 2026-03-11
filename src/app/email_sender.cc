@@ -14,12 +14,15 @@
 namespace gatehouse::app {
 namespace {
 
+// LOW-01: CurlGlobal is now a non-local static so curl_global_init runs at
+// program startup (before any threads are created), not on the first call.
 struct CurlGlobal {
   CurlGlobal() { curl_global_init(CURL_GLOBAL_DEFAULT); }
   ~CurlGlobal() { curl_global_cleanup(); }
   CurlGlobal(const CurlGlobal&) = delete;
   CurlGlobal& operator=(const CurlGlobal&) = delete;
 };
+CurlGlobal g_curl_global;
 
 struct CurlEasy {
   CurlEasy() : h(curl_easy_init()) {}
@@ -27,6 +30,16 @@ struct CurlEasy {
   CURL* get() const { return h; }
   CURL* h = nullptr;
 };
+
+// HIGH-04: Strip CR and LF from SMTP header values to prevent header injection.
+static std::string SanitizeSmtpHeaderValue(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (char c : in) {
+    if (c != '\r' && c != '\n') out += c;
+  }
+  return out;
+}
 
 static std::string JoinAddressesHeader(std::string_view header_name,
                                        const std::vector<std::string>& addrs) {
@@ -39,7 +52,6 @@ static std::string JoinAddressesHeader(std::string_view header_name,
     if (i) out.append(", ");
     out.append(addrs[i]);
   }
-  out.append("\r\n");
   return out;
 }
 
@@ -61,10 +73,9 @@ static std::string FormatFromHeader(const std::string& from_email,
     out += from_name;
     out += " <";
     out += from_email;
-    out += ">\r\n";
+    out += ">";
   } else {
     out += from_email;
-    out += "\r\n";
   }
   return out;
 }
@@ -98,8 +109,6 @@ static core::Result<void> SendMailSmtps(const std::string& smtp_url,
                                        const std::string& username,
                                        const std::string& app_password,
                                        const MailSpec& spec) {
-  static CurlGlobal curl_global;
-
   CurlEasy curl;
   if (!curl.get()) {
     return core::Result<void>::Err(core::Status::Error(core::StatusCode::kInternal,
@@ -126,16 +135,19 @@ static core::Result<void> SendMailSmtps(const std::string& smtp_url,
   curl_easy_setopt(curl.get(), CURLOPT_MAIL_RCPT, rcpt);
 
   struct curl_slist* headers = nullptr;
-  const std::string from_hdr = FormatFromHeader(spec.from_email, spec.from_name);
+  const std::string from_hdr = FormatFromHeader(
+      SanitizeSmtpHeaderValue(spec.from_email),
+      SanitizeSmtpHeaderValue(spec.from_name));
   const std::string to_hdr = JoinAddressesHeader("To", spec.addrs.to);
   const std::string cc_hdr = JoinAddressesHeader("Cc", spec.addrs.cc);
-  const std::string subject_hdr = "Subject: " + spec.subject + "\r\n";
+  const std::string subject_hdr =
+      "Subject: " + SanitizeSmtpHeaderValue(spec.subject);
 
   headers = curl_slist_append(headers, from_hdr.c_str());
   if (!to_hdr.empty()) headers = curl_slist_append(headers, to_hdr.c_str());
   if (!cc_hdr.empty()) headers = curl_slist_append(headers, cc_hdr.c_str());
   headers = curl_slist_append(headers, subject_hdr.c_str());
-  headers = curl_slist_append(headers, "MIME-Version: 1.0\r\n");
+  headers = curl_slist_append(headers, "MIME-Version: 1.0");
 
   curl_mime* mime = curl_mime_init(curl.get());
   if (!mime) {
@@ -203,9 +215,9 @@ core::Result<void> ConsoleEmailSender::Send(const MailSpec& spec) {
 }
 
 CurlSmtpsEmailSender::CurlSmtpsEmailSender() {
-  const char* env_user = std::getenv("GMAIL_USER");
-  const char* env_pass = std::getenv("GMAIL_APP_PASS");
-  const char* env_url = std::getenv("SMTP_URL");
+  const char* env_user = std::getenv("GATEHOUSE_SMTP_USER");
+  const char* env_pass = std::getenv("GATEHOUSE_SMTP_PASS");
+  const char* env_url = std::getenv("GATEHOUSE_SMTP_URL");
 
   username_ = env_user ? env_user : "";
   app_password_ = env_pass ? env_pass : "";
@@ -228,7 +240,7 @@ core::Result<void> CurlSmtpsEmailSender::Send(const MailSpec& spec) {
   if (username_.empty() || app_password_.empty()) {
     return core::Result<void>::Err(core::Status::Error(
         core::StatusCode::kFailedPrecondition,
-        "missing env: GMAIL_USER / GMAIL_APP_PASS (and optional SMTP_URL)"));
+        "missing env: GATEHOUSE_SMTP_USER / GATEHOUSE_SMTP_PASS (and optional GATEHOUSE_SMTP_URL)"));
   }
   if (spec.from_email.empty()) {
     return core::Result<void>::Err(core::Status::Error(

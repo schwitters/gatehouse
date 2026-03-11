@@ -15,9 +15,14 @@ class SqliteDb;
 namespace gatehouse::app {
 
 struct HttpServerConfig {
+  std::string instance_title{"Gatehouse"};
+
   std::string bind_addr{"0.0.0.0"};
   std::uint16_t port{18080};
   std::uint32_t threads{2};
+
+  // If non-empty, listen on a Unix Domain Socket instead of TCP.
+  std::string unix_socket;
 
   std::string session_cookie_name{"gh_sid"};
   std::int64_t session_ttl_seconds{3600};
@@ -42,6 +47,10 @@ struct HttpServerConfig {
 
   // LDIF fallback (optional)
   std::string ldif_path;
+
+  // Set Secure flag on session cookies (required for HTTPS deployments).
+  // Disable for plain-HTTP deployments.
+  bool secure_cookies{false};
 };
 
 class HttpServer final {

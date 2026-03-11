@@ -211,14 +211,17 @@ inline core::Result<void> GetKrb5InitCredsPassword(
                             "GetKrb5InitCredsPassword: invalid argument"));
   }
 
-  char* password_mut = const_cast<char*>(password.c_str());
+  // CRIT-04: Copy password into a mutable buffer; const_cast on std::string
+  // internal storage is UB if the library modifies the buffer.
+  std::vector<char> password_buf(password.begin(), password.end());
+  password_buf.push_back('\0');
   char* service_mut = const_cast<char*>(service);
 
   const krb5_error_code rc = krb5_get_init_creds_password(
       ctx,
       creds,
       principal,
-      password_mut,
+      password_buf.data(),
       /*prompter=*/nullptr,
       /*data=*/nullptr,
       /*start_time=*/0,

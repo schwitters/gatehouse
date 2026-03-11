@@ -1,3 +1,4 @@
 build/
 gatehouse.db
 build-asan/
+build-test/

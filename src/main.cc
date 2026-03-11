@@ -13,15 +13,51 @@ namespace {
 
 void PrintUsage(const char* argv0) {
   std::cerr
-      << "Usage: " << argv0
-      << " [--bind ADDR] [--port PORT] [--threads N] [--db PATH]\n"
-      << "       [--session-ttl SECONDS] [--cookie NAME]\n"
-      << "       [--realm REALM]\n"
-      << "       [--public-base-url URL] [--invite-ttl SECONDS]\n"
-      << "       [--admin-uids CSV] [--ldap-admin-group DN] [--email-backend console|curl]\n"
-      << "       [--ldap-url URL] [--ldap-bind-dn DN] [--ldap-bind-pw PW]\n"
-      << "       [--ldap-base-dn DN] [--ldap-starttls]\n"
-      << "       [--ldif PATH]  (fallback)\n";
+      << "Usage: " << argv0 << " [OPTIONS]\n"
+      << "\n"
+      << "General:\n"
+      << "  --instance-title TITLE Instance title shown in UI and emails (default: Gatehouse)\n"
+      << "\n"
+      << "Server:\n"
+      << "  --bind ADDR            TCP bind address (default: 0.0.0.0)\n"
+      << "  --port PORT            TCP port (default: 18080)\n"
+      << "  --unix-socket PATH     Listen on Unix Domain Socket instead of TCP\n"
+      << "  --threads N            Worker threads (default: 2)\n"
+      << "  --db PATH              SQLite database path (default: gatehouse.db)\n"
+      << "\n"
+      << "Session:\n"
+      << "  --session-ttl SECONDS  Session lifetime (default: 3600)\n"
+      << "  --cookie NAME          Session cookie name (default: gh_sid)\n"
+      << "\n"
+      << "Auth:\n"
+      << "  --realm REALM          Kerberos realm\n"
+      << "\n"
+      << "Invitations:\n"
+      << "  --public-base-url URL  Base URL for invite links (default: http://127.0.0.1:18080)\n"
+      << "  --invite-ttl SECONDS   Invite link lifetime (default: 604800)\n"
+      << "  --admin-uids CSV       Comma-separated UIDs with admin access (default: demo)\n"
+      << "  --ldap-admin-group DN  LDAP group DN whose members get admin access\n"
+      << "  --email-backend MODE   Email delivery: console (default) | curl\n"
+      << "\n"
+      << "LDAP:\n"
+      << "  --ldap-url URL         LDAP server URL (ldap:// or ldaps://)\n"
+      << "  --ldap-bind-dn DN      Bind DN\n"
+      << "  --ldap-bind-pw PW      Bind password\n"
+      << "  --ldap-base-dn DN      Base DN (default: dc=catuno,dc=lab)\n"
+      << "  --ldap-starttls        Upgrade LDAP connection with StartTLS\n"
+      << "\n"
+      << "Security:\n"
+      << "  --secure-cookies       Set Secure flag on session cookies (use with HTTPS/reverse proxy)\n"
+      << "  --ldif PATH            LDIF file as directory fallback (dev/test)\n"
+      << "\n"
+      << "Environment variables:\n"
+      << "  GATEHOUSE_MASTER_KEY_HEX   (required) 64 hex chars = 32-byte AES-256-GCM key\n"
+      << "                             Generate: openssl rand -hex 32\n"
+      << "  GATEHOUSE_KADM5_ADMIN_PRINC  Kerberos admin principal for invite completion\n"
+      << "  GATEHOUSE_KADM5_ADMIN_PASS   Kerberos admin password\n"
+      << "  GATEHOUSE_SMTP_USER        SMTP username (--email-backend curl)\n"
+      << "  GATEHOUSE_SMTP_PASS        SMTP app password (--email-backend curl)\n"
+      << "  GATEHOUSE_SMTP_URL         SMTP server URL (default: smtps://smtp.gmail.com:465)\n";
 }
 
 bool ParseU16(const std::string& s, std::uint16_t* out) {
@@ -66,6 +102,8 @@ std::vector<std::string> SplitCsv(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 1) { PrintUsage(argv[0]); return 0; }
+
   gatehouse::app::HttpServerConfig cfg;
   std::string db_path{"gatehouse.db"};
 
@@ -90,6 +128,8 @@ int main(int argc, char** argv) {
       if (!ParseI64(argv[++i], &ttl) || ttl <= 0) { std::cerr << "Invalid --session-ttl\n"; return 2; }
       cfg.session_ttl_seconds = ttl; continue;
     }
+    if (arg == "--instance-title" && i + 1 < argc) { cfg.instance_title = argv[++i]; continue; }
+    if (arg == "--unix-socket" && i + 1 < argc) { cfg.unix_socket = argv[++i]; continue; }
     if (arg == "--cookie" && i + 1 < argc) { cfg.session_cookie_name = argv[++i]; continue; }
     if (arg == "--realm" && i + 1 < argc) { cfg.auth_cfg.krb5_realm = argv[++i]; continue; }
 
@@ -109,6 +149,7 @@ int main(int argc, char** argv) {
     if (arg == "--ldap-bind-pw" && i + 1 < argc) { cfg.ldap_bind_pw = argv[++i]; continue; }
     if (arg == "--ldap-base-dn" && i + 1 < argc) { cfg.ldap_base_dn = argv[++i]; continue; }
     if (arg == "--ldap-starttls") { cfg.ldap_starttls = true; continue; }
+    if (arg == "--secure-cookies") { cfg.secure_cookies = true; continue; }
 
     // LDIF fallback
     if (arg == "--ldif" && i + 1 < argc) { cfg.ldif_path = argv[++i]; continue; }

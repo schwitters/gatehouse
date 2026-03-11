@@ -201,6 +201,10 @@ bool IsLdapsUrl(const std::string& url) {
   return url.rfind("ldaps://", 0) == 0;
 }
 
+bool IsLdapiUrl(const std::string& url) {
+  return url.rfind("ldapi://", 0) == 0;
+}
+
 std::string BuildUsersBase(const LdapConfig& cfg, const std::string& tenant_ou) {
   return "cn=users,cn=accounts,ou=" + tenant_ou + "," + cfg.base_dn;
 }
@@ -237,10 +241,18 @@ core::Result<LdapHandle> ConnectAndBind(const LdapConfig& cfg) {
   }
 
   if (cfg.starttls && !IsLdapsUrl(cfg.url)) {
+    // MED-06: Require server certificate verification before upgrading to TLS.
+    int tls_req = LDAP_OPT_X_TLS_DEMAND;
+    (void)ldap_set_option(ld.get(), LDAP_OPT_X_TLS_REQUIRE_CERT, &tls_req);
     rc = ldap_start_tls_s(ld.get(), nullptr, nullptr);
     if (rc != LDAP_SUCCESS) {
       return core::Result<LdapHandle>::Err(LErr("ldap_start_tls_s", rc));
     }
+  } else if (!IsLdapsUrl(cfg.url) && !IsLdapiUrl(cfg.url)) {
+    std::fprintf(stderr,
+                 "[gatehouse][ldap] WARNING: connecting without TLS (%s). "
+                 "Credentials will be transmitted in plaintext.\n",
+                 cfg.url.c_str());
   }
 
   struct berval cred;
@@ -528,6 +540,100 @@ core::Result<void> LdapDirectory::ActivateUser(const std::string& tenant_ou,
   }
 
   std::fprintf(stderr, "[gatehouse][ldap] ActivateUser success\n");
+  return core::Result<void>::Ok();
+}
+
+core::Result<bool> LdapDirectory::HasKrbAttributes(
+    const std::string& tenant_ou, const std::string& uid) const {
+  if (tenant_ou.empty() || uid.empty()) {
+    return core::Result<bool>::Ok(false);
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) return core::Result<bool>::Err(ld_res.status());
+  LdapHandle ld = std::move(ld_res.value());
+
+  auto user_dn_res = FindUserDnByUid(cfg_, ld.get(), tenant_ou, uid);
+  if (!user_dn_res.ok()) return core::Result<bool>::Err(user_dn_res.status());
+  if (!user_dn_res.value().has_value()) return core::Result<bool>::Ok(false);
+  const std::string user_dn = *user_dn_res.value();
+
+  char* attrs[] = {
+      const_cast<char*>("krbExtraData"),
+      const_cast<char*>("krbLastPwdChange"),
+      const_cast<char*>("krbLoginFailedCount"),
+      const_cast<char*>("krbPrincipalKey"),
+      const_cast<char*>("krbPrincipalName"),
+      nullptr};
+
+  struct timeval tv{cfg_.network_timeout_seconds, 0};
+  LDAPMessage* raw_res = nullptr;
+  const int rc = ldap_search_ext_s(ld.get(), user_dn.c_str(), LDAP_SCOPE_BASE,
+                                   "(objectClass=*)", attrs, 0,
+                                   nullptr, nullptr, &tv, 1, &raw_res);
+  LdapMessageHandle res(raw_res);
+
+  if (rc != LDAP_SUCCESS && rc != LDAP_SIZELIMIT_EXCEEDED) {
+    return core::Result<bool>::Err(LErr("ldap_search_ext_s(has-krb-attrs)", rc));
+  }
+
+  LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
+  if (entry == nullptr) return core::Result<bool>::Ok(false);
+
+  for (const char* attr : {"krbExtraData", "krbLastPwdChange", "krbLoginFailedCount",
+                            "krbPrincipalKey", "krbPrincipalName"}) {
+    BervalValuesHandle vals(
+        ldap_get_values_len(ld.get(), entry, const_cast<char*>(attr)));
+    if (vals && vals[0] != nullptr) return core::Result<bool>::Ok(true);
+  }
+
+  return core::Result<bool>::Ok(false);
+}
+
+core::Result<void> LdapDirectory::DeleteKrbAttributes(
+    const std::string& tenant_ou, const std::string& uid) const {
+  std::fprintf(stderr, "[gatehouse][ldap] DeleteKrbAttributes begin tenant_ou=%s uid=%s\n",
+               tenant_ou.c_str(), uid.c_str());
+
+  if (tenant_ou.empty() || uid.empty()) {
+    return core::Result<void>::Err(core::Status::Error(
+        core::StatusCode::kInvalidArgument, "tenant_ou/uid empty"));
+  }
+
+  auto ld_res = ConnectAndBind(cfg_);
+  if (!ld_res.ok()) return core::Result<void>::Err(ld_res.status());
+  LdapHandle ld = std::move(ld_res.value());
+
+  auto user_dn_res = FindUserDnByUid(cfg_, ld.get(), tenant_ou, uid);
+  if (!user_dn_res.ok()) return core::Result<void>::Err(user_dn_res.status());
+  if (!user_dn_res.value().has_value() || user_dn_res.value()->empty()) {
+    return core::Result<void>::Err(core::Status::Error(
+        core::StatusCode::kNotFound, "User not found for Kerberos attribute deletion"));
+  }
+  const std::string user_dn = *user_dn_res.value();
+
+  std::fprintf(stderr, "[gatehouse][ldap] DeleteKrbAttributes DN: %s\n", user_dn.c_str());
+
+  const char* krb_attrs[] = {
+      "krbExtraData", "krbLastPwdChange", "krbLoginFailedCount",
+      "krbPrincipalKey", "krbPrincipalName"};
+
+  for (const char* attr : krb_attrs) {
+    LDAPMod mod;
+    std::memset(&mod, 0, sizeof(mod));
+    mod.mod_op = LDAP_MOD_DELETE;
+    mod.mod_type = const_cast<char*>(attr);
+    mod.mod_values = nullptr;
+    LDAPMod* mods[] = {&mod, nullptr};
+
+    const int rc = ldap_modify_ext_s(ld.get(), user_dn.c_str(), mods, nullptr, nullptr);
+    if (rc != LDAP_SUCCESS && rc != LDAP_NO_SUCH_ATTRIBUTE) {
+      std::fprintf(stderr, "[gatehouse][ldap] DeleteKrbAttributes: delete %s returned %d (%s)\n",
+                   attr, rc, ldap_err2string(rc));
+    }
+  }
+
+  std::fprintf(stderr, "[gatehouse][ldap] DeleteKrbAttributes done\n");
   return core::Result<void>::Ok();
 }
 
