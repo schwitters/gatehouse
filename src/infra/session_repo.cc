@@ -34,7 +34,8 @@ std::string BlobToHex(const void* data, int size) {
 SessionRepo::SessionRepo(SqliteDb& db) : db_(db) {}
 
 core::Result<void> SessionRepo::Insert(const SessionRow& row,
-                                      const std::vector<std::uint8_t>& csrf_secret) {
+                                      const std::vector<std::uint8_t>& csrf_secret,
+                                      const std::vector<std::uint8_t>& ip_hash) {
   sqlite3* dbh = db_.handle();
   if (dbh == nullptr) {
     return core::Result<void>::Err(
@@ -43,8 +44,8 @@ core::Result<void> SessionRepo::Insert(const SessionRow& row,
 
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
-      "INSERT INTO auth_session(sid,uid,tenant_id,created_at,expires_at,mfa_state,csrf_secret,ticket_id)"
-      " VALUES(?,?,?,?,?,?,?,?);";
+      "INSERT INTO auth_session(sid,uid,tenant_id,created_at,expires_at,mfa_state,csrf_secret,ticket_id,ip_hash)"
+      " VALUES(?,?,?,?,?,?,?,?,?);";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) return core::Result<void>::Err(MakeStmtStatus(rc, dbh, "prepare(insert)"));
 
@@ -60,6 +61,12 @@ core::Result<void> SessionRepo::Insert(const SessionRow& row,
     (void)sqlite3_bind_null(stmt, 8);
   } else {
     (void)sqlite3_bind_text(stmt, 8, row.ticket_id.c_str(), -1, SQLITE_TRANSIENT);
+  }
+  if (ip_hash.empty()) {
+    (void)sqlite3_bind_null(stmt, 9);
+  } else {
+    (void)sqlite3_bind_blob(stmt, 9, ip_hash.data(),
+                            static_cast<int>(ip_hash.size()), SQLITE_TRANSIENT);
   }
 
   rc = sqlite3_step(stmt);
@@ -79,7 +86,7 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
       "SELECT sid,uid,tenant_id,created_at,expires_at,mfa_state,COALESCE(ticket_id,''),"
-      "csrf_secret "
+      "csrf_secret,ip_hash "
       "FROM auth_session WHERE sid=?";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) {
@@ -102,6 +109,11 @@ core::Result<std::optional<SessionRow>> SessionRepo::GetBySid(const std::string&
     const int csrf_size = sqlite3_column_bytes(stmt, 7);
     if (csrf_blob != nullptr && csrf_size > 0) {
       row.csrf_secret_hex = BlobToHex(csrf_blob, csrf_size);
+    }
+    const void* ip_blob = sqlite3_column_blob(stmt, 8);
+    const int ip_size = sqlite3_column_bytes(stmt, 8);
+    if (ip_blob != nullptr && ip_size > 0) {
+      row.ip_hash_hex = BlobToHex(ip_blob, ip_size);
     }
     sqlite3_finalize(stmt);
     return core::Result<std::optional<SessionRow>>::Ok(std::optional<SessionRow>(std::move(row)));

@@ -9,14 +9,12 @@
 namespace gatehouse::app {
 
 enum class AuthMode {
-  kDemo = 0,
   kKrb5 = 1,
 };
 
 struct AuthConfig {
-  AuthMode mode{AuthMode::kDemo};
+  AuthMode mode{AuthMode::kKrb5};
   std::string krb5_realm;
-  bool allow_demo_fallback{false};
 };
 
 struct LoginRequest {

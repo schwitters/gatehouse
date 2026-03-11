@@ -21,6 +21,7 @@ struct SessionRow {
   // New in schema v2
   std::string ticket_id;       // may be empty (demo mode)
   std::string csrf_secret_hex; // hex-encoded 32-byte CSRF secret (populated by GetBySid)
+  std::string ip_hash_hex;     // hex-encoded SHA256 of client IP at login (populated by GetBySid)
 };
 
 class SessionRepo final {
@@ -28,7 +29,8 @@ class SessionRepo final {
   explicit SessionRepo(SqliteDb& db);
 
   [[nodiscard]] core::Result<void> Insert(const SessionRow& row,
-                                         const std::vector<std::uint8_t>& csrf_secret);
+                                         const std::vector<std::uint8_t>& csrf_secret,
+                                         const std::vector<std::uint8_t>& ip_hash = {});
 
   [[nodiscard]] core::Result<std::optional<SessionRow>> GetBySid(const std::string& sid);
 

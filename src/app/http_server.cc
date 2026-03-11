@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -59,6 +60,9 @@ crow::response HtmlPage(int code, const std::string& html) {
   crow::response r;
   r.code = code;
   r.set_header("Content-Type", "text/html; charset=utf-8");
+  r.set_header("X-Content-Type-Options", "nosniff");
+  r.set_header("X-Frame-Options", "DENY");
+  r.set_header("Referrer-Policy", "strict-origin-when-cross-origin");
   r.body = html;
   return r;
 }
@@ -74,6 +78,7 @@ crow::response Json(int code, const crow::json::wvalue& v) {
   crow::response r;
   r.code = code;
   r.set_header("Content-Type", "application/json; charset=utf-8");
+  r.set_header("X-Content-Type-Options", "nosniff");
   r.body = v.dump();
   return r;
 }
@@ -165,7 +170,6 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
 </style></head>
 <body>
 <h1>Gatehouse</h1>
-<p class="hint">Temporary demo login: <code>demo</code> / <code>demo</code></p>
 <form method="post" action="/auth/login">
   <label>Username <input name="username" autocomplete="username" required></label>
   <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
@@ -513,6 +517,30 @@ core::Result<void> HttpServer::Run() {
       (void)invite_sessions.DeleteExpired(core::UnixNow());
     };
 
+    // Login rate limiting: max 10 attempts per IP per 5 minutes.
+    std::mutex login_rl_mutex;
+    std::unordered_map<std::string, std::pair<int, std::int64_t>> login_attempts;
+    constexpr int kLoginMaxAttempts = 10;
+    constexpr std::int64_t kLoginWindowSecs = 300;
+    auto check_login_rate_limit = [&](const std::string& ip) -> bool {
+      std::lock_guard<std::mutex> lk(login_rl_mutex);
+      auto& entry = login_attempts[ip];
+      const std::int64_t now_ts = core::UnixNow();
+      if (now_ts - entry.second > kLoginWindowSecs) {
+        entry = {0, now_ts};
+      }
+      entry.first++;
+      return entry.first <= kLoginMaxAttempts;
+    };
+
+    // Compute SHA256 of a remote IP string for session binding.
+    auto hash_remote_ip = [](const std::string& ip) -> std::vector<std::uint8_t> {
+      if (ip.empty()) return {};
+      const std::vector<std::uint8_t> ip_bytes(ip.begin(), ip.end());
+      auto h = core::Sha256(ip_bytes);
+      return h.ok() ? h.value() : std::vector<std::uint8_t>{};
+    };
+
     auto require_auth = [&](const crow::request& req) -> std::optional<infra::SessionRow> {
       gc_sessions();
       const std::string sid = CookieValueFromHeader(req, cfg_.session_cookie_name);
@@ -521,6 +549,16 @@ core::Result<void> HttpServer::Run() {
       if (!got.ok() || !got.value().has_value()) return std::nullopt;
       const infra::SessionRow& row = *got.value();
       if (row.expires_at <= core::UnixNow()) return std::nullopt;
+      // IP binding: validate that the request comes from the same IP as the login.
+      if (!row.ip_hash_hex.empty()) {
+        const std::vector<std::uint8_t> req_ip_hash = hash_remote_ip(req.remote_ip_address);
+        if (req_ip_hash.empty() ||
+            core::HexEncode(req_ip_hash) != row.ip_hash_hex) {
+          std::fprintf(stderr, "[gatehouse][security] Session IP mismatch for uid=%s\n",
+                       row.uid.c_str());
+          return std::nullopt;
+        }
+      }
       return row;
     };
 
@@ -594,6 +632,10 @@ core::Result<void> HttpServer::Run() {
     });
 
     CROW_ROUTE(app, "/auth/login").methods("POST"_method)([&](const crow::request& req) {
+      if (!check_login_rate_limit(req.remote_ip_address)) {
+        return RedirectTo("/login?err=Too+many+login+attempts.+Please+try+again+in+5+minutes.");
+      }
+
       const std::optional<std::string> u = core::FormGet(req.body, "username");
       const std::optional<std::string> p = core::FormGet(req.body, "password");
 
@@ -627,7 +669,8 @@ core::Result<void> HttpServer::Run() {
       row.mfa_state = 0;
       row.ticket_id = ticket_id.value();
 
-      auto ins = sessions.Insert(row, csrf_bytes.value());
+      const std::vector<std::uint8_t> ip_hash = hash_remote_ip(req.remote_ip_address);
+      auto ins = sessions.Insert(row, csrf_bytes.value(), ip_hash);
       if (!ins.ok()) return RedirectTo("/login?err=Internal+error");
 
       auto r = RedirectTo("/portal");
@@ -744,9 +787,6 @@ core::Result<void> HttpServer::Run() {
       } else {
         // --- POST Logic ---
         if (!csrf_ok_form(req, *s)) return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
-        if (cfg_.auth_cfg.mode == AuthMode::kDemo || s->uid == "demo") {
-          return RedirectTo("/portal/changepw?err=Demo+users+cannot+change+passwords");
-        }
 
         const std::string old_pw = core::FormGet(req.body, "old_password").value_or("");
         const std::string new_pw = core::FormGet(req.body, "new_password").value_or("");
@@ -795,22 +835,41 @@ core::Result<void> HttpServer::Run() {
       auto hash = core::Sha256(token_bytes.value());
       if (!hash.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
+      // BEGIN IMMEDIATE transaction to prevent race condition: two concurrent requests
+      // with the same token must not both create valid invite sessions.
+      auto tx = db_->Exec("BEGIN IMMEDIATE;");
+      if (!tx.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+
       auto row = invites.GetByTokenHash(hash.value());
-      if (!row.ok() || !row.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+      if (!row.ok() || !row.value().has_value()) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(404, "<h1>Invitation not found</h1>");
+      }
 
       const auto now = core::UnixNow();
       const auto& inv = *row.value();
 
-      if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) return HtmlPage(410, "<h1>Invitation revoked</h1>");
+      if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(410, "<h1>Invitation revoked</h1>");
+      }
+      if (inv.status == infra::InviteStatus::kCompleted) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(410, "<h1>Invitation already completed</h1>");
+      }
       if (inv.expires_at <= now) {
         (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kExpired, now);
+        (void)db_->Exec("COMMIT;");
         return HtmlPage(410, "<h1>Invitation expired</h1>");
       }
 
       (void)invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kLinkVerified, now);
 
       auto sid_bytes = core::RandomBytes(32);
-      if (!sid_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (!sid_bytes.ok()) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(500, "<h1>Internal error</h1>");
+      }
 
       infra::InviteSessionRow s;
       s.sid = core::HexEncode(sid_bytes.value());
@@ -819,7 +878,13 @@ core::Result<void> HttpServer::Run() {
       s.expires_at = now + 1800;
 
       auto ins = invite_sessions.Insert(s);
-      if (!ins.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
+      if (!ins.ok()) {
+        (void)db_->Exec("ROLLBACK;");
+        return HtmlPage(500, "<h1>Internal error</h1>");
+      }
+
+      auto cm = db_->Exec("COMMIT;");
+      if (!cm.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
       auto r = RedirectTo("/invite/complete");
       r.add_header("Set-Cookie", std::string(kInviteCookie) + "=" + s.sid +
@@ -870,15 +935,22 @@ core::Result<void> HttpServer::Run() {
       html += "<p class='muted'>Email: <b>" + crow::json::escape(row.invited_email) + "</b></p>";
       html += msg;
 
+      // Use the invite session SID as CSRF token: it is HttpOnly so external JS cannot
+      // read it, but the server embeds it in HTML and validates it on every POST.
+      const std::string inv_csrf = crow::json::escape(is->sid);
       if (!verified) {
         html += "<h3>Verify email</h3>";
-        html += "<form method='post' action='/invite/otp/send'><button type='submit'>Send code</button></form>";
+        html += "<form method='post' action='/invite/otp/send'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
+        html += "<button type='submit'>Send code</button></form>";
         html += "<form method='post' action='/invite/otp/verify'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
         html += "<label>Code<input name='code' placeholder='123456' autocomplete='one-time-code'></label>";
         html += "<button type='submit'>Verify</button></form>";
       } else {
         html += "<h3>Profile</h3>";
         html += "<form method='post' action='/invite/complete'>";
+        html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
         html += "<label>Display name (optional)<input name='display_name' value='" + crow::json::escape(display) + "'></label>";
         html += "<label>New Password<input type='password' name='password' required minlength='8'></label>";
         html += "<label>Confirm Password<input type='password' name='password_confirm' required minlength='8'></label>";
@@ -892,6 +964,11 @@ core::Result<void> HttpServer::Run() {
     CROW_ROUTE(app, "/invite/complete").methods("POST"_method)([&](const crow::request& req) {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
+
+      const auto csrf_val = core::FormGet(req.body, "_csrf");
+      if (!csrf_val.has_value() || *csrf_val != is->sid) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
 
       auto inv = invites.GetById(is->invite_id);
       if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
@@ -960,6 +1037,11 @@ core::Result<void> HttpServer::Run() {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
 
+      const auto csrf_val = core::FormGet(req.body, "_csrf");
+      if (!csrf_val.has_value() || *csrf_val != is->sid) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
+
       const std::int64_t now = core::UnixNow();
 
       // Cooldown check (Rate Limiting)
@@ -1025,6 +1107,11 @@ core::Result<void> HttpServer::Run() {
       auto is = require_invite_session(req);
       if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
 
+      const auto csrf_val = core::FormGet(req.body, "_csrf");
+      if (!csrf_val.has_value() || *csrf_val != is->sid) {
+        return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
+      }
+
       const std::optional<std::string> c = core::FormGet(req.body, "code");
       const std::string code = c.value_or("");
       if (code.size() < 4 || code.size() > 10) return RedirectTo("/invite/complete?err=invalid+code");
@@ -1087,6 +1174,10 @@ core::Result<void> HttpServer::Run() {
     });
 
     CROW_ROUTE(app, "/api/auth/login").methods("POST"_method)([&](const crow::request& req) {
+      if (!check_login_rate_limit(req.remote_ip_address)) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]="too many login attempts"; return Json(429, v);
+      }
+
       auto body = crow::json::load(req.body);
       if (!body) {
         crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json"; return Json(400, v);
@@ -1128,7 +1219,8 @@ core::Result<void> HttpServer::Run() {
       row.mfa_state = 0;
       row.ticket_id = ticket_id.value();
 
-      auto ins = sessions.Insert(row, csrf_bytes.value());
+      const std::vector<std::uint8_t> ip_hash_api = hash_remote_ip(req.remote_ip_address);
+      auto ins = sessions.Insert(row, csrf_bytes.value(), ip_hash_api);
       if (!ins.ok()) {
         crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
       }
@@ -1161,7 +1253,11 @@ core::Result<void> HttpServer::Run() {
       if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
 
       auto ldap_res = ldap_dir->ListUsers(tenant);
-      if (!ldap_res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=ldap_res.status().ToString(); return Json(502, v); }
+      if (!ldap_res.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] ListUsers failed for %s: %s\n",
+                     tenant.c_str(), ldap_res.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
 
       auto inv_res = invites.GetInvitedUids(tenant, core::UnixNow());
       if (!inv_res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=inv_res.status().ToString(); return Json(500, v); }
@@ -1258,7 +1354,11 @@ core::Result<void> HttpServer::Run() {
         std::optional<std::string> mail;
         if (ldap_dir.has_value()) {
           auto rc = ldap_dir->LookupMail(tenant_ou, uid);
-          if (!rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=rc.status().ToString(); return Json(502, v); }
+          if (!rc.ok()) {
+            std::fprintf(stderr, "[gatehouse][ldap] LookupMail failed for %s/%s: %s\n",
+                         tenant_ou.c_str(), uid.c_str(), rc.status().ToString().c_str());
+            crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+          }
           mail = rc.value();
         } else if (!cfg_.ldif_path.empty()) {
           mail = ldif_dir.LookupMail(tenant_ou, uid);
@@ -1521,7 +1621,11 @@ loadTenants();
       if (!ldap_dir.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="LDAP not configured"; return Json(500, v); }
 
       auto res = ldap_dir->ListTenants();
-      if (!res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=res.status().ToString(); return Json(502, v); }
+      if (!res.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] ListTenants failed: %s\n",
+                     res.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
 
       crow::json::wvalue v;
       v["ok"] = true;
@@ -1544,7 +1648,11 @@ loadTenants();
       if (tenant.empty()) { crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id required"; return Json(400, v); }
 
       auto res = ldap_dir->ListUsersWithHosts(tenant);
-      if (!res.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=res.status().ToString(); return Json(502, v); }
+      if (!res.ok()) {
+        std::fprintf(stderr, "[gatehouse][ldap] ListUsersWithHosts failed for %s: %s\n",
+                     tenant.c_str(), res.status().ToString().c_str());
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
 
       // Build uid -> latest invite map.
       auto inv_res = invites.GetLatestPerUid(tenant);

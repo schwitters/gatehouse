@@ -16,7 +16,7 @@ void PrintUsage(const char* argv0) {
       << "Usage: " << argv0
       << " [--bind ADDR] [--port PORT] [--threads N] [--db PATH]\n"
       << "       [--session-ttl SECONDS] [--cookie NAME]\n"
-      << "       [--auth demo|krb5] [--realm REALM] [--allow-demo-fallback]\n"
+      << "       [--realm REALM]\n"
       << "       [--public-base-url URL] [--invite-ttl SECONDS]\n"
       << "       [--admin-uids CSV] [--ldap-admin-group DN] [--email-backend console|curl]\n"
       << "       [--ldap-url URL] [--ldap-bind-dn DN] [--ldap-bind-pw PW]\n"
@@ -91,15 +91,7 @@ int main(int argc, char** argv) {
       cfg.session_ttl_seconds = ttl; continue;
     }
     if (arg == "--cookie" && i + 1 < argc) { cfg.session_cookie_name = argv[++i]; continue; }
-    if (arg == "--auth" && i + 1 < argc) {
-      const std::string v = argv[++i];
-      if (v == "demo") cfg.auth_cfg.mode = gatehouse::app::AuthMode::kDemo;
-      else if (v == "krb5") cfg.auth_cfg.mode = gatehouse::app::AuthMode::kKrb5;
-      else { std::cerr << "Invalid --auth\n"; return 2; }
-      continue;
-    }
     if (arg == "--realm" && i + 1 < argc) { cfg.auth_cfg.krb5_realm = argv[++i]; continue; }
-    if (arg == "--allow-demo-fallback") { cfg.auth_cfg.allow_demo_fallback = true; continue; }
 
     if (arg == "--public-base-url" && i + 1 < argc) { cfg.public_base_url = argv[++i]; continue; }
     if (arg == "--invite-ttl" && i + 1 < argc) {

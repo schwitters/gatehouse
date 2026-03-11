@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include <openssl/crypto.h>
 #include <sqlite3.h>
 
 namespace gatehouse::infra {
@@ -114,7 +115,9 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
     return core::Result<bool>::Ok(false);
   }
 
-  const bool matched = (db_hash == otp_hash);
+  // Constant-time comparison to prevent timing attacks.
+  const bool matched = (db_hash.size() == otp_hash.size() && !db_hash.empty() &&
+                        CRYPTO_memcmp(db_hash.data(), otp_hash.data(), db_hash.size()) == 0);
 
   sqlite3_stmt* upd = nullptr;
   const char* upd_sql =

@@ -25,25 +25,9 @@ core::Result<std::optional<LoginPrincipal>> AuthService::Verify(const LoginReque
         core::Status::Error(core::StatusCode::kInvalidArgument, "missing credentials"));
   }
 
-  if (cfg_.mode == AuthMode::kDemo) {
-    if (req.username == "demo" && req.password == "demo") {
-      LoginPrincipal p;
-      p.uid = "demo";
-      p.tenant_id = "default";
-      return core::Result<std::optional<LoginPrincipal>>::Ok(std::optional<LoginPrincipal>(p));
-    }
-    return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
-  }
-
   infra::Krb5Client krb(infra::Krb5Config{.realm = cfg_.krb5_realm});
   auto vr = krb.VerifyPasswordAndGetCcache(req.username, req.password);
   if (!vr.ok()) {
-    if (cfg_.allow_demo_fallback && req.username == "demo" && req.password == "demo") {
-      LoginPrincipal p;
-      p.uid = "demo";
-      p.tenant_id = "default";
-      return core::Result<std::optional<LoginPrincipal>>::Ok(std::optional<LoginPrincipal>(p));
-    }
     return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
   }
 
