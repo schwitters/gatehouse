@@ -86,12 +86,21 @@ find_package(CURL REQUIRED)
 add_executable(gatehouse
   src/main.cc
   src/app/http_server.cc
+  src/app/http_utils.cc
+  src/app/server_context.cc
+  src/app/routes_misc.cc
+  src/app/routes_auth.cc
+  src/app/routes_portal.cc
+  src/app/routes_invite.cc
+  src/app/routes_admin.cc
+  src/app/routes_guacamole.cc
   src/app/auth.cc
   src/app/email_sender.cc
   src/infra/invite_repo.cc
   src/infra/invite_session_repo.cc
   src/infra/invite_otp_repo.cc
   src/infra/ldif_directory.cc
+  src/core/result.cc
   src/core/sha256.cc
 
   src/core/hex.cc
@@ -110,7 +119,9 @@ add_executable(gatehouse
   src/infra/cred_fetch_token_repo.cc
   src/infra/ticket_vault_repo.cc
   src/core/crypto_aead.cc
+  src/core/aes_cbc.cc
 )
+
 
 target_include_directories(gatehouse
   PRIVATE
@@ -165,6 +176,7 @@ target_link_libraries(gatehouse PRIVATE CURL::libcurl)
 # Core static library (no I/O, no Kerberos/LDAP — for unit tests)
 # ----------------------------
 add_library(gatehouse_core_lib STATIC
+  src/core/result.cc
   src/core/crypto_aead.cc
   src/core/hex.cc
   src/core/random.cc

@@ -46,6 +46,11 @@ void PrintUsage(const char* argv0) {
       << "  --ldap-base-dn DN      Base DN (default: dc=catuno,dc=lab)\n"
       << "  --ldap-starttls        Upgrade LDAP connection with StartTLS\n"
       << "\n"
+      << "Guacamole:\n"
+      << "  --guacamole-url URL    Guacamole web app base URL (enables Connect buttons)\n"
+      << "  --guacamole-secret S   Shared secret for Guacamole Encrypted JSON auth\n"
+      << "  --guac-token-ttl SECS  Credential-fetch token lifetime (default: 60)\n"
+      << "\n"
       << "Security:\n"
       << "  --secure-cookies       Set Secure flag on session cookies (use with HTTPS/reverse proxy)\n"
       << "  --ldif PATH            LDIF file as directory fallback (dev/test)\n"
@@ -150,6 +155,15 @@ int main(int argc, char** argv) {
     if (arg == "--ldap-base-dn" && i + 1 < argc) { cfg.ldap_base_dn = argv[++i]; continue; }
     if (arg == "--ldap-starttls") { cfg.ldap_starttls = true; continue; }
     if (arg == "--secure-cookies") { cfg.secure_cookies = true; continue; }
+
+    // Guacamole
+    if (arg == "--guacamole-url" && i + 1 < argc) { cfg.guacamole_url = argv[++i]; continue; }
+    if (arg == "--guacamole-secret" && i + 1 < argc) { cfg.guacamole_secret = argv[++i]; continue; }
+    if (arg == "--guac-token-ttl" && i + 1 < argc) {
+      std::int64_t ttl{};
+      if (!ParseI64(argv[++i], &ttl) || ttl <= 0) { std::cerr << "Invalid --guac-token-ttl\n"; return 2; }
+      cfg.guac_token_ttl_seconds = ttl; continue;
+    }
 
     // LDIF fallback
     if (arg == "--ldif" && i + 1 < argc) { cfg.ldif_path = argv[++i]; continue; }

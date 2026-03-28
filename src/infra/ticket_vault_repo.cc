@@ -60,4 +60,25 @@ core::Result<void> TicketVaultRepo::Insert(const TicketVaultRow& row) {
   return core::Result<void>::Ok();
 }
 
+core::Result<void> TicketVaultRepo::Delete(const std::string& ticket_id) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) {
+    return core::Result<void>::Err(
+        core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+  }
+
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql = "DELETE FROM ticket_vault WHERE ticket_id = ?;";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<void>::Err(MakeStmtStatus(rc, dbh, "prepare(delete)"));
+
+  (void)sqlite3_bind_text(stmt, 1, ticket_id.c_str(), -1, SQLITE_TRANSIENT);
+
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) return core::Result<void>::Err(MakeStmtStatus(rc, dbh, "step(delete)"));
+
+  return core::Result<void>::Ok();
+}
+
 }  // namespace gatehouse::infra

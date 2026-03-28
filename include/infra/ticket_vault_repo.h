@@ -28,6 +28,7 @@ class TicketVaultRepo final {
   explicit TicketVaultRepo(SqliteDb& db);
 
   [[nodiscard]] core::Result<void> Insert(const TicketVaultRow& row);
+  [[nodiscard]] core::Result<void> Delete(const std::string& ticket_id);
 
  private:
   SqliteDb& db_;

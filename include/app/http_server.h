@@ -51,6 +51,14 @@ struct HttpServerConfig {
   // Set Secure flag on session cookies (required for HTTPS deployments).
   // Disable for plain-HTTP deployments.
   bool secure_cookies{false};
+
+  // Guacamole Encrypted JSON Authentication.
+  // guacamole_url: base URL of the Guacamole web app (e.g. https://guac.example.com).
+  // guacamole_secret: shared secret; first 16 UTF-8 bytes used as AES-128-CBC key.
+  // guac_token_ttl_seconds: credential-fetch token lifetime (default: 60 s).
+  std::string guacamole_url;
+  std::string guacamole_secret;
+  std::int64_t guac_token_ttl_seconds{60};
 };
 
 class HttpServer final {
