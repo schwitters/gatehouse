@@ -1,0 +1,24 @@
+[Unit]
+Description=Gatehouse Authentication and Session Gateway
+After=network.target
+Documentation=man:gatehouse(8)
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/gatehouse \
+    --db /var/lib/gatehouse/gatehouse.db \
+    --port 18080 \
+    --bind 127.0.0.1
+EnvironmentFile=-/etc/gatehouse/gatehouse.env
+# SQL migrations are loaded relative to WorkingDirectory
+WorkingDirectory=/usr/share/gatehouse
+Restart=on-failure
+RestartSec=5
+StateDirectory=gatehouse
+ReadWritePaths=/var/lib/gatehouse
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

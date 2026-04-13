@@ -95,6 +95,7 @@ core::Result<std::string> BuildGuacUrl(
 }  // namespace
 
 void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
+  const std::string& B = ctx.cfg.base_uri;
 
   // ---- POST /api/me/guacamole-session ----
   // Creates a short-lived credential-fetch token, builds a Guacamole Encrypted
@@ -102,7 +103,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   //
   // Request body (JSON): {"hostname": "...", "protocol": "rdp"|"ssh"}
   // Response (JSON):     {"ok": true, "url": "..."}
-  CROW_ROUTE(app, "/api/me/guacamole-session")
+  app.route_dynamic(B + "/api/me/guacamole-session")
       .methods("POST"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
@@ -220,7 +221,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // Query params: token=<hex>, uid=<uid>, host=<hostname>
   // Returns: {"ok": true, "ccache_b64": "<base64>"}
   // The Kerberos ticket is deleted from the vault after retrieval (one-time use).
-  CROW_ROUTE(app, "/api/cred-fetch/ticket")
+  app.route_dynamic(B + "/api/cred-fetch/ticket")
       .methods("GET"_method)([&ctx](const crow::request& req) {
     const std::string token_hex = req.url_params.get("token") ?
         req.url_params.get("token") : "";

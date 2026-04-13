@@ -12,25 +12,29 @@
 namespace gatehouse::app {
 
 void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
+  const std::string& B = ctx.cfg.base_uri;
+
   // ---- Root redirect ----
-  CROW_ROUTE(app, "/").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/").methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
-    if (!s.has_value()) return RedirectTo("/login");
-    return RedirectTo("/portal");
+    if (!s.has_value()) return RedirectTo(B + "/login");
+    return RedirectTo(B + "/portal");
   });
 
   // ---- Portal dashboard ----
-  CROW_ROUTE(app, "/portal").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/portal").methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
-    if (!s.has_value()) return RedirectTo("/login");
+    if (!s.has_value()) return RedirectTo(B + "/login");
 
     const bool is_admin = IsAdminUid(ctx, s->uid);
     std::string admin_block;
     if (is_admin) {
       admin_block = "<p><b>Admin</b>: ";
-      admin_block += "<a href=\"/admin/invites\">Invitations</a>";
+      admin_block += "<a href=\"" + B + "/admin/invites\">Invitations</a>";
       admin_block += " &nbsp;|&nbsp; ";
-      admin_block += "<a href=\"/admin/tenants\">Tenant &amp; User Overview</a>";
+      admin_block += "<a href=\"" + B + "/admin/tenants\">Tenant &amp; User Overview</a>";
       admin_block += "</p>";
     }
 
@@ -61,20 +65,21 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     // Card: Security
     html += "<div class=\"card\"><h3>Security</h3>";
     html += "<p style=\"color:#555\">Manage your Kerberos account credentials.</p>";
-    html += "<a href=\"/portal/changepw\" style=\"display:inline-block;padding:10px 16px;background:#0b57d0;color:#fff;text-decoration:none;border-radius:6px;font-weight:600\">Change Password</a>";
+    html += "<a href=\"" + B + "/portal/changepw\" style=\"display:inline-block;padding:10px 16px;background:#0b57d0;color:#fff;text-decoration:none;border-radius:6px;font-weight:600\">Change Password</a>";
     html += "</div>";
 
     // Card: Logout (CSRF token embedded)
-    html += "<form method=\"post\" action=\"/auth/logout\">";
+    html += "<form method=\"post\" action=\"" + B + "/auth/logout\">";
     html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
     html += "<button type=\"submit\">Logout</button></form>";
 
     // JavaScript to fetch and render hosts
     // MED-08: Use DOM APIs with textContent to avoid innerHTML XSS from LDAP data.
     html += "<script>";
+    html += "const _B='" + B + "';";
     html += "function getCsrfToken(){var m=document.cookie.match(/(^|;)\\s*gh_csrf=([^;]+)/);return m?decodeURIComponent(m[2]):''}";
     html += "async function connectHost(hostname,protocol){";
-    html += "  const r=await fetch('/api/me/guacamole-session',{method:'POST',";
+    html += "  const r=await fetch(_B+'/api/me/guacamole-session',{method:'POST',";
     html += "    headers:{'Content-Type':'application/json','X-CSRF-Token':getCsrfToken()},";
     html += "    body:JSON.stringify({hostname:hostname,protocol:protocol})});";
     html += "  const j=await r.json();";
@@ -82,7 +87,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "  window.open(j.url,'_blank');";
     html += "}";
     html += "async function loadHosts() {";
-    html += "  const r = await fetch('/api/me/hosts');";
+    html += "  const r = await fetch(_B+'/api/me/hosts');";
     html += "  const div = document.getElementById('hostContainer');";
     html += "  if (!r.ok) { div.innerHTML = '<p style=\"color:#b00020\">Failed to load hosts.</p>'; return; }";
     html += "  const j = await r.json();";
@@ -120,10 +125,11 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Change password (GET + POST) ----
-  CROW_ROUTE(app, "/portal/changepw").methods("GET"_method, "POST"_method)(
+  app.route_dynamic(B + "/portal/changepw").methods("GET"_method, "POST"_method)(
       [&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
-    if (!s.has_value()) return RedirectTo("/login");
+    if (!s.has_value()) return RedirectTo(B + "/login");
 
     if (req.method == "GET"_method) {
       const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
@@ -135,11 +141,11 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "button{margin-top:24px;padding:12px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600;width:100%;font-size:1em}";
       html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:500} a:hover{text-decoration:underline}";
       html += "</style></head><body>";
-      html += "<p><a href=\"/portal\">&larr; Back to Dashboard</a></p>";
+      html += "<p><a href=\"" + B + "/portal\">&larr; Back to Dashboard</a></p>";
       html += "<h1>Change Password</h1>";
       html += "<div class=\"card\">";
       if (!err.empty()) html += "<div style=\"color:#b00020;background:#fce8e6;padding:12px;border-radius:8px;margin-bottom:16px\"><b>Error:</b> " + crow::json::escape(err) + "</div>";
-      html += "<form method=\"post\" action=\"/portal/changepw\">";
+      html += "<form method=\"post\" action=\"" + B + "/portal/changepw\">";
       html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
       html += "<label>Old Password <input type=\"password\" name=\"old_password\" required autofocus></label>";
       html += "<label>New Password <input type=\"password\" name=\"new_password\" required minlength=\"8\"></label>";
@@ -156,8 +162,8 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string new_pw  = core::FormGet(req.body, "new_password").value_or("");
     const std::string conf_pw = core::FormGet(req.body, "new_password_confirm").value_or("");
 
-    if (old_pw.empty() || new_pw.empty()) return RedirectTo("/portal/changepw?err=Missing+password+fields");
-    if (new_pw != conf_pw) return RedirectTo("/portal/changepw?err=New+passwords+do+not+match");
+    if (old_pw.empty() || new_pw.empty()) return RedirectTo(B + "/portal/changepw?err=Missing+password+fields");
+    if (new_pw != conf_pw) return RedirectTo(B + "/portal/changepw?err=New+passwords+do+not+match");
 
     infra::Krb5Client krb(infra::Krb5Config{.realm = ctx.cfg.auth_cfg.krb5_realm});
     auto rc = krb.ChangePassword(s->uid, old_pw, new_pw);
@@ -165,15 +171,15 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (!rc.ok()) {
       std::fprintf(stderr, "[gatehouse][changepw] KDC error for %s: %s\n",
                    s->uid.c_str(), rc.status().ToString().c_str());
-      return RedirectTo("/portal/changepw?err=Password+change+failed."
+      return RedirectTo(B + "/portal/changepw?err=Password+change+failed."
                         "+Check+your+old+password+and+ensure+the+new+password+meets+policy.");
     }
 
-    return RedirectTo("/portal?ok=Password+successfully+changed");
+    return RedirectTo(B + "/portal?ok=Password+successfully+changed");
   });
 
   // ---- API: current user info ----
-  CROW_ROUTE(app, "/api/me").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/me").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v);
@@ -187,7 +193,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- API: user's managed hosts ----
-  CROW_ROUTE(app, "/api/me/hosts").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/me/hosts").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v);

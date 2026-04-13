@@ -55,6 +55,10 @@ void PrintUsage(const char* argv0) {
       << "  --secure-cookies       Set Secure flag on session cookies (use with HTTPS/reverse proxy)\n"
       << "  --ldif PATH            LDIF file as directory fallback (dev/test)\n"
       << "\n"
+      << "Reverse proxy:\n"
+      << "  --base-uri PATH        URL path prefix (e.g. /gatehouse). Must start with /,\n"
+      << "                         must not end with /. Empty = serve at root (default)\n"
+      << "\n"
       << "Environment variables:\n"
       << "  GATEHOUSE_MASTER_KEY_HEX   (required) 64 hex chars = 32-byte AES-256-GCM key\n"
       << "                             Generate: openssl rand -hex 32\n"
@@ -167,6 +171,9 @@ int main(int argc, char** argv) {
 
     // LDIF fallback
     if (arg == "--ldif" && i + 1 < argc) { cfg.ldif_path = argv[++i]; continue; }
+
+    // Reverse proxy
+    if (arg == "--base-uri" && i + 1 < argc) { cfg.base_uri = argv[++i]; continue; }
 
     std::cerr << "Unknown arg: " << arg << "\n";
     PrintUsage(argv[0]);

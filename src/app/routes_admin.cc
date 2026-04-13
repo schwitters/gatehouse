@@ -44,7 +44,7 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
 </head>
 <body>
   <h1>Invitations</h1>
-  <p><a href="/portal">Back to portal</a></p>
+  <p><a href="%B%/portal">Back to portal</a></p>
 
   <div class="card">
     <h2>Create invite</h2>
@@ -99,6 +99,7 @@ const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
   </div>
 
 <script>
+const _B='%B%';
 function getCsrfToken() {
   const m = document.cookie.match(/(?:^|;\s*)gh_csrf=([^;]+)/);
   return m ? m[1] : '';
@@ -107,7 +108,7 @@ function getCsrfToken() {
 async function apiJson(method, path, body) {
   const opt = {method, headers: {"Content-Type":"application/json", "X-CSRF-Token": getCsrfToken()}};
   if (body !== undefined) opt.body = JSON.stringify(body);
-  const r = await fetch(path, opt);
+  const r = await fetch(_B+path, opt);
   const t = await r.text();
   let j = null;
   try { j = JSON.parse(t); } catch(e) {}
@@ -237,7 +238,7 @@ async function refresh() {
   const q = new URLSearchParams();
   if (t) q.set("tenant_id", t);
   if (u) q.set("invited_uid", u);
-  const r = await fetch("/api/admin/invites/list?" + q.toString());
+  const r = await fetch(_B+"/api/admin/invites/list?" + q.toString());
   const j = await r.json().catch(() => null);
   if (!r.ok) {
     setStatus("statusList", "err", "Error (" + r.status + ")");
@@ -252,7 +253,7 @@ async function searchUninvited() {
   const t = document.getElementById("uninvTenant").value.trim();
   if (!t) { setStatus("statusUninvited", "err", "Please enter a Tenant OU."); return; }
 
-  const r = await fetch("/api/admin/uninvited?tenant_id=" + encodeURIComponent(t));
+  const r = await fetch(_B+"/api/admin/uninvited?tenant_id=" + encodeURIComponent(t));
   const j = await r.json().catch(() => null);
   if (!r.ok) { setStatus("statusUninvited", "err", "Error: " + (j && j.error ? j.error : r.status)); return; }
 
@@ -320,18 +321,29 @@ refresh();
 }  // namespace
 
 void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
+  const std::string& B = ctx.cfg.base_uri;
+
   // ---- Admin invitations page ----
-  CROW_ROUTE(app, "/admin/invites").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/admin/invites").methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
-    if (!s.has_value()) return RedirectTo("/login");
+    if (!s.has_value()) return RedirectTo(B + "/login");
     if (!IsAdminUid(ctx, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
-    return HtmlPage(200, ApplyTitle(kAdminInvitesPage, ctx.cfg.instance_title));
+    // ApplyTitle also substitutes %B% with base_uri
+    std::string page = ApplyTitle(kAdminInvitesPage, ctx.cfg.instance_title);
+    std::size_t pos = 0;
+    while ((pos = page.find("%B%", pos)) != std::string::npos) {
+      page.replace(pos, 3, B);
+      pos += B.size();
+    }
+    return HtmlPage(200, page);
   });
 
   // ---- Admin tenant/user overview page ----
-  CROW_ROUTE(app, "/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
-    if (!s.has_value()) return RedirectTo("/login");
+    if (!s.has_value()) return RedirectTo(B + "/login");
     if (!IsAdminUid(ctx, s->uid)) return HtmlPage(403, "<h1>Forbidden</h1>");
 
     const std::string csrf = s->csrf_secret_hex;
@@ -353,7 +365,7 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
                        "button:hover{background:#0842a0}"
                        "</style></head><body>"
                        "<h1>Tenant &amp; User Overview</h1>"
-                       "<p><a href='/portal'>&larr; Back to portal</a></p>"
+                       "<p><a href='" + B + "/portal'>&larr; Back to portal</a></p>"
                        "<div class='card'>"
                        "<h2>Select Tenant</h2>"
                        "<select id='tenantSel'><option value=''>Loading...</option></select>"
@@ -363,6 +375,7 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
                        "<div id='result'></div>"
                        "<script>";
 
+    html += "const _B='" + B + "';\n";
     html += "const CSRF = '" + csrf + "';\n";
     html += R"JS(
 const STATUS_NAMES = {
@@ -387,7 +400,7 @@ function statusPill(status, expiresAt) {
 }
 
 async function loadTenants() {
-  const r = await fetch('/api/admin/tenants');
+  const r = await fetch(_B+'/api/admin/tenants');
   const j = await r.json().catch(() => null);
   const sel = document.getElementById('tenantSel');
   if (!r.ok || !j || !j.items) { sel.innerHTML = '<option>Error loading tenants</option>'; return; }
@@ -403,7 +416,7 @@ async function sendInvite(tenantId, uid, btnEl) {
   btnEl.disabled = true;
   const orig = btnEl.textContent;
   btnEl.textContent = 'Sending...';
-  const r = await fetch('/api/admin/invites', {
+  const r = await fetch(_B+'/api/admin/invites', {
     method: 'POST',
     headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
     body: JSON.stringify({tenant_ou: tenantId, uid})
@@ -423,7 +436,7 @@ async function loadUsers() {
   if (!t) { document.getElementById('status').textContent = 'Please select a tenant.'; return; }
   document.getElementById('status').textContent = 'Loading...';
   document.getElementById('result').innerHTML = '';
-  const r = await fetch('/api/admin/tenant-users?tenant_id=' + encodeURIComponent(t),
+  const r = await fetch(_B+'/api/admin/tenant-users?tenant_id=' + encodeURIComponent(t),
                         {headers: {'X-CSRF-Token': CSRF}});
   const j = await r.json().catch(() => null);
   if (!r.ok || !j) {
@@ -513,7 +526,7 @@ loadTenants();
   });
 
   // ---- API: List uninvited users ----
-  CROW_ROUTE(app, "/api/admin/uninvited").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/uninvited").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -554,7 +567,7 @@ loadTenants();
   });
 
   // ---- API: List latest invites (with optional filters) ----
-  CROW_ROUTE(app, "/api/admin/invites/list").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/invites/list").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -588,7 +601,7 @@ loadTenants();
   });
 
   // ---- API: Revoke invite ----
-  CROW_ROUTE(app, "/api/admin/invites/revoke").methods("POST"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/invites/revoke").methods("POST"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -624,7 +637,7 @@ loadTenants();
   });
 
   // ---- API: Create invite ----
-  CROW_ROUTE(app, "/api/admin/invites").methods("POST"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/invites").methods("POST"_method)([&ctx](const crow::request& req) {
     try {
       auto s = RequireAuth(ctx, req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
@@ -738,7 +751,7 @@ loadTenants();
   });
 
   // ---- API: Kerberos attribute status for a user ----
-  CROW_ROUTE(app, "/api/admin/user/krb-status").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/user/krb-status").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -762,7 +775,7 @@ loadTenants();
   });
 
   // ---- API: Reset Kerberos attributes for a user ----
-  CROW_ROUTE(app, "/api/admin/user/reset-krb").methods("POST"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/user/reset-krb").methods("POST"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -790,7 +803,7 @@ loadTenants();
   });
 
   // ---- API: List tenants ----
-  CROW_ROUTE(app, "/api/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -814,7 +827,7 @@ loadTenants();
   });
 
   // ---- API: List users with hosts for a tenant ----
-  CROW_ROUTE(app, "/api/admin/tenant-users").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/api/admin/tenant-users").methods("GET"_method)([&ctx](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }

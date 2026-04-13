@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 enable_testing()
 
-project(gatehouse LANGUAGES CXX)
+project(gatehouse VERSION 0.0.11 LANGUAGES CXX)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,6 +39,8 @@ add_definitions(-DCROW_USE_BOOST)
 add_definitions(-DCROW_ENABLE_STATIC_FILE=1)
 add_definitions(-DBOOST_ASIO_NO_DEPRECATED)
 set(CROW_USE_BOOST ON)
+
+set(CROW_INSTALL OFF CACHE BOOL "" FORCE)
 
 include(FetchContent)
 
@@ -221,3 +223,12 @@ target_link_libraries(gatehouse_tests PRIVATE
 )
 include(GoogleTest)
 gtest_discover_tests(gatehouse_tests)
+
+# ── Installation ──────────────────────────────────────────────────────────────
+include(GNUInstallDirs)
+
+install(TARGETS gatehouse DESTINATION ${CMAKE_INSTALL_SBINDIR})
+# SQL migration files — read at runtime relative to WorkingDirectory=/usr/share/gatehouse
+install(DIRECTORY db/ DESTINATION /usr/share/gatehouse/db
+        FILES_MATCHING PATTERN "*.sql")
+install(FILES data/gatehouse.service DESTINATION /lib/systemd/system/)

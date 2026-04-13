@@ -59,6 +59,10 @@ struct HttpServerConfig {
   std::string guacamole_url;
   std::string guacamole_secret;
   std::int64_t guac_token_ttl_seconds{60};
+
+  // URL path prefix for hosting under a sub-path (e.g. "/gatehouse").
+  // Must start with '/' or be empty. Must not end with '/'.
+  std::string base_uri{""};
 };
 
 class HttpServer final {

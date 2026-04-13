@@ -102,9 +102,10 @@ bool CsrfOkHeader(const crow::request& req, const infra::SessionRow& s) {
 }
 
 void SetCsrfCookie(crow::response& r, const std::string& csrf_hex,
-                   std::int64_t max_age) {
+                   std::int64_t max_age, const std::string& base_uri) {
+  const std::string path = base_uri.empty() ? "/" : base_uri + "/";
   r.add_header("Set-Cookie",
-               "gh_csrf=" + csrf_hex + "; Path=/; Max-Age=" +
+               "gh_csrf=" + csrf_hex + "; Path=" + path + "; Max-Age=" +
                    std::to_string(max_age) + "; SameSite=Strict");
 }
 

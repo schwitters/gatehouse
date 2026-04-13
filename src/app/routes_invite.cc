@@ -18,8 +18,12 @@
 namespace gatehouse::app {
 
 void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
+  const std::string& B = ctx.cfg.base_uri;
+
   // ---- Accept invite token -> invite_session cookie ----
-  CROW_ROUTE(app, "/invite/accept").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/invite/accept").methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
+    const std::string cookie_path = B.empty() ? "/" : B + "/";
     const char* t = req.url_params.get("token");
     if (t == nullptr) return HtmlPage(400, "<h1>Invalid invitation</h1>");
     const std::string token_hex = t;
@@ -81,14 +85,15 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     auto cm = ctx.db.Exec("COMMIT;");
     if (!cm.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
-    auto r = RedirectTo("/invite/complete");
+    auto r = RedirectTo(B + "/invite/complete");
     r.add_header("Set-Cookie", std::string(kInviteCookie) + "=" + s.sid +
-                               "; Path=/; Max-Age=1800; HttpOnly; SameSite=Lax");
+                               "; Path=" + cookie_path + "; Max-Age=1800; HttpOnly; SameSite=Lax");
     return r;
   });
 
   // ---- Complete invite wizard (GET) ----
-  CROW_ROUTE(app, "/invite/complete").methods("GET"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/invite/complete").methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value())
       return HtmlPage(401, "<h1>Invitation session expired</h1><p>Please open your invite link again.</p>");
@@ -162,7 +167,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We'll send a 6-digit code to:</p>";
       html += "<div class='info-row' style='margin-top:8px'><b>" + crow::json::escape(row.invited_email) + "</b></div>";
       if (!err.empty()) html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
-      html += "<form method='post' action='/invite/otp/send'>";
+      html += "<form method='post' action='" + B + "/invite/otp/send'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<button type='submit' class='btn btn-primary'>Send Verification Code</button>";
       html += "</form></div>";
@@ -171,13 +176,13 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "<h2>Enter verification code</h2>";
       html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We sent a 6-digit code to <b>" + crow::json::escape(row.invited_email) + "</b>.<br>It expires in 10&nbsp;minutes.</p>";
       if (!err.empty()) html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
-      html += "<form method='post' action='/invite/otp/verify'>";
+      html += "<form method='post' action='" + B + "/invite/otp/verify'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<label>Verification code";
       html += "<input name='code' class='code-input' placeholder='123456' autocomplete='one-time-code' inputmode='numeric' maxlength='6' required></label>";
       html += "<button type='submit' class='btn btn-primary'>Verify Code</button>";
       html += "</form>";
-      html += "<form method='post' action='/invite/otp/send'>";
+      html += "<form method='post' action='" + B + "/invite/otp/send'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<button type='submit' class='btn btn-ghost'>Resend Code</button>";
       html += "</form></div>";
@@ -186,7 +191,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "<h2>Set up your account</h2>";
       html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>Email verified. Choose a password to complete your registration.</p>";
       if (!err.empty()) html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
-      html += "<form method='post' action='/invite/complete'>";
+      html += "<form method='post' action='" + B + "/invite/complete'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<label>Display name <span style='color:#aaa;font-weight:400'>(optional)</span>";
       html += "<input name='display_name' placeholder='Your full name' value='" + crow::json::escape(display) + "'></label>";
@@ -203,7 +208,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Complete invite wizard (POST) ----
-  CROW_ROUTE(app, "/invite/complete").methods("POST"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/invite/complete").methods("POST"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
 
@@ -216,7 +222,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     // attacker could POST directly to /invite/complete and skip email verification.
     auto verified_res = ctx.invite_otps.IsVerified(is->sid);
     if (!verified_res.ok() || !verified_res.value()) {
-      return RedirectTo("/invite/complete?err=Email+verification+required");
+      return RedirectTo(B + "/invite/complete?err=Email+verification+required");
     }
 
     auto inv = ctx.invites.GetById(is->invite_id);
@@ -228,7 +234,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string pwd2 = core::FormGet(req.body, "password_confirm").value_or("");
 
     if (pwd1.empty() || pwd1 != pwd2) {
-      return RedirectTo("/invite/complete?err=Passwords+do+not+match");
+      return RedirectTo(B + "/invite/complete?err=Passwords+do+not+match");
     }
 
     const char* env_kadmin_princ = std::getenv("GATEHOUSE_KADM5_ADMIN_PRINC");
@@ -248,7 +254,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
         if (!krc.ok()) {
           std::fprintf(stderr, "[gatehouse][kadm5] Failed to create principal: %s\n",
                        SanitizeForLog(krc.status().ToString()).c_str());
-          return RedirectTo("/invite/complete?err=Failed+to+create+Kerberos+principal");
+          return RedirectTo(B + "/invite/complete?err=Failed+to+create+Kerberos+principal");
         }
       }
     }
@@ -298,16 +304,18 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     done_html += "<div class='check'>\xe2\x9c\x93</div>";
     done_html += "<h2>You're all set!</h2>";
     done_html += "<p style='text-align:center;color:#555;font-size:.93em'>Your invitation has been completed. You can now sign in with your new credentials.</p>";
-    done_html += "<a href='/login' class='btn btn-primary'>Sign In</a>";
+    done_html += "<a href='" + B + "/login' class='btn btn-primary'>Sign In</a>";
     done_html += "</div></div></body></html>";
 
+    const std::string cookie_path = B.empty() ? "/" : B + "/";
     auto r = HtmlPage(200, done_html);
-    r.add_header("Set-Cookie", std::string(kInviteCookie) + "=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    r.add_header("Set-Cookie", std::string(kInviteCookie) + "=deleted; Path=" + cookie_path + "; Max-Age=0; HttpOnly; SameSite=Lax");
     return r;
   });
 
   // ---- Send OTP email ----
-  CROW_ROUTE(app, "/invite/otp/send").methods("POST"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/invite/otp/send").methods("POST"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
 
@@ -324,7 +332,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (last_issued.value().has_value()) {
       const std::int64_t diff = now - last_issued.value().value();
       if (diff < 60) {
-        return RedirectTo("/invite/complete?err=Please+wait+60+seconds+before+requesting+a+new+code");
+        return RedirectTo(B + "/invite/complete?err=Please+wait+60+seconds+before+requesting+a+new+code");
       }
     }
 
@@ -377,11 +385,12 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (!mail_rc.ok()) return HtmlPage(502, "<h1>Mail send failed</h1>");
 
     (void)ctx.invites.UpdateStatus(row.invite_id, infra::InviteStatus::kStepupSent, now);
-    return RedirectTo("/invite/complete?sent=1");
+    return RedirectTo(B + "/invite/complete?sent=1");
   });
 
   // ---- Verify OTP ----
-  CROW_ROUTE(app, "/invite/otp/verify").methods("POST"_method)([&ctx](const crow::request& req) {
+  app.route_dynamic(B + "/invite/otp/verify").methods("POST"_method)([&ctx](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
 
@@ -391,7 +400,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     }
 
     const std::string code = core::FormGet(req.body, "code").value_or("");
-    if (code.size() < 4 || code.size() > 10) return RedirectTo("/invite/complete?err=invalid+code");
+    if (code.size() < 4 || code.size() > 10) return RedirectTo(B + "/invite/complete?err=invalid+code");
 
     std::vector<std::uint8_t> otp_bytes(code.begin(), code.end());
     auto h = core::Sha256(otp_bytes);
@@ -400,13 +409,13 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::int64_t now = core::UnixNow();
     auto ok = ctx.invite_otps.VerifyAndConsume(is->sid, h.value(), now);
     if (!ok.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
-    if (!ok.value()) return RedirectTo("/invite/complete?err=wrong+code");
+    if (!ok.value()) return RedirectTo(B + "/invite/complete?err=wrong+code");
 
     auto inv_otp = ctx.invites.GetById(is->invite_id);
     if (inv_otp.ok() && inv_otp.value().has_value()) {
       (void)ctx.invites.UpdateStatus(is->invite_id, infra::InviteStatus::kStepupVerified, now);
     }
-    return RedirectTo("/invite/complete?ok=1");
+    return RedirectTo(B + "/invite/complete?ok=1");
   });
 }
 
