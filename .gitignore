@@ -2,3 +2,5 @@ build/
 gatehouse.db
 build-asan/
 build-test/
+.deb-staging/
+build-deb/

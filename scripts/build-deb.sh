@@ -56,6 +56,11 @@ DESTDIR="${STAGING_DIR}" cmake --install "${BUILD_DIR}" --prefix /usr
 install -d -m 755 "${STAGING_DIR}/etc/gatehouse"
 install -m 640 "${PROJECT_ROOT}/data/gatehouse.env.example" \
     "${STAGING_DIR}/etc/gatehouse/gatehouse.env.example"
+# conffile: gatehouse.env muss physisch im Paket vorhanden sein.
+# postinst überschreibt es NICHT, wenn der Admin es schon angepasst hat —
+# dpkg merkt Änderungen und fragt beim Upgrade nach.
+install -m 640 "${PROJECT_ROOT}/data/gatehouse.env.example" \
+    "${STAGING_DIR}/etc/gatehouse/gatehouse.env"
 
 # Laufzeit-Zustandsverzeichnis (per postinst angelegt)
 install -d -m 750 "${STAGING_DIR}/var/lib/gatehouse"
@@ -107,11 +112,11 @@ set -e
 
 install -d -m 750 -o root -g root /var/lib/gatehouse
 
-# Beispiel-Konfiguration bereitstellen, falls noch keine vorhanden
-if [ ! -f /etc/gatehouse/gatehouse.env ]; then
-    install -m 640 /etc/gatehouse/gatehouse.env.example \
-                   /etc/gatehouse/gatehouse.env
-    echo "  HINWEIS: /etc/gatehouse/gatehouse.env wurde angelegt."
+# /etc/gatehouse/gatehouse.env wird vom Paket als conffile ausgeliefert.
+# Beim Erstinstall enthält es den Platzhalter aus der Example-Datei.
+# Der Admin muss GATEHOUSE_MASTER_KEY_HEX setzen, bevor der Dienst startet.
+if grep -q 'CHANGE_ME' /etc/gatehouse/gatehouse.env 2>/dev/null; then
+    echo "  HINWEIS: /etc/gatehouse/gatehouse.env enthält noch Platzhalter."
     echo "  Bitte GATEHOUSE_MASTER_KEY_HEX eintragen, dann starten:"
     echo "    systemctl enable --now gatehouse"
 fi
