@@ -226,6 +226,12 @@ core::Result<void> Krb5Client::ChangePassword(
   }
 
   if (rc != 0) {
+    if (rc == KRB5_KDC_UNREACH) {
+      return core::Result<void>::Err(
+          core::Status::Error(core::StatusCode::kUnavailable,
+                              "kpasswd service unreachable (port 464) — "
+                              "ensure krb5-admin-server is running on the KDC"));
+    }
     return core::Result<void>::Err(
         Krb5ErrorStatus("krb5_change_password failed", ctx.get(), rc));
   }

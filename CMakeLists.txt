@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 enable_testing()
 
-project(gatehouse VERSION 0.6.0 LANGUAGES CXX)
+project(gatehouse VERSION 0.7.0 LANGUAGES CXX)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

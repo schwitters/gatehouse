@@ -236,6 +236,9 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (pwd1.empty() || pwd1 != pwd2) {
       return RedirectTo(B + "/invite/complete?err=Passwords+do+not+match");
     }
+    if (pwd1.size() < 8) {
+      return RedirectTo(B + "/invite/complete?err=Password+must+be+at+least+8+characters");
+    }
 
     const char* env_kadmin_princ = std::getenv("GATEHOUSE_KADM5_ADMIN_PRINC");
     const char* env_kadmin_pass  = std::getenv("GATEHOUSE_KADM5_ADMIN_PASS");

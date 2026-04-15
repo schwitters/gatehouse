@@ -163,6 +163,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string conf_pw = core::FormGet(req.body, "new_password_confirm").value_or("");
 
     if (old_pw.empty() || new_pw.empty()) return RedirectTo(B + "/portal/changepw?err=Missing+password+fields");
+    if (new_pw.size() < 8) return RedirectTo(B + "/portal/changepw?err=New+password+must+be+at+least+8+characters");
     if (new_pw != conf_pw) return RedirectTo(B + "/portal/changepw?err=New+passwords+do+not+match");
 
     infra::Krb5Client krb(infra::Krb5Config{.realm = ctx.cfg.auth_cfg.krb5_realm});
@@ -171,8 +172,15 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (!rc.ok()) {
       std::fprintf(stderr, "[gatehouse][changepw] KDC error for %s: %s\n",
                    s->uid.c_str(), rc.status().ToString().c_str());
-      return RedirectTo(B + "/portal/changepw?err=Password+change+failed."
-                        "+Check+your+old+password+and+ensure+the+new+password+meets+policy.");
+      const char* err_param;
+      if (rc.status().code() == core::StatusCode::kUnavailable) {
+        err_param = "Password+service+temporarily+unavailable+%E2%80%94+contact+admin";
+      } else if (rc.status().code() == core::StatusCode::kUnauthenticated) {
+        err_param = "Old+password+incorrect";
+      } else {
+        err_param = "Password+change+failed.+Ensure+new+password+meets+policy.";
+      }
+      return RedirectTo(B + "/portal/changepw?err=" + err_param);
     }
 
     return RedirectTo(B + "/portal?ok=Password+successfully+changed");
