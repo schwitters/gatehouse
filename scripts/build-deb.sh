@@ -76,16 +76,26 @@ DEBIAN_DIR="${STAGING_DIR}/DEBIAN"
 mkdir -p "${DEBIAN_DIR}"
 
 # Laufzeit-Abhängigkeiten ermitteln
+LDAP_PKG="$(dpkg -l 'libldap2*' 2>/dev/null \
+    | awk '/^ii/{print $2}' | grep -v '\-dev' | sort -r | head -1 || true)"
+LDAP_PKG="${LDAP_PKG:-libldap-2.5-0}"
+
 BOOST_PKG="$(dpkg -l 'libboost-system*' 2>/dev/null \
     | awk '/^ii/{print $2}' | grep -v '\-dev' | sort -r | head -1 || true)"
 BOOST_PKG="${BOOST_PKG:-libboost-system1.83.0}"
+#libboost-date-time1.83.0
+
+BOOST_DATETIME_PKG="$(dpkg -l 'libboost-date-time*' 2>/dev/null \
+    | awk '/^ii/{print $2}' | grep -v '\-dev' | sort -r | head -1 || true)"
+
+BOOST_DATETIME_PKG="${BOOST_DATETIME_PKG:-libboost-date-time1.83.0}"
 
 CURL_PKG="$(dpkg -l 'libcurl4*' 2>/dev/null \
     | awk '/^ii/{print $2}' | grep -v '\-dev' | sort -r | head -1 || true)"
 CURL_PKG="${CURL_PKG:-libcurl4}"
 
 DEPENDS="libsqlite3-0, libkrb5-3, libgssapi-krb5-2, libkadm5clnt-mit12 | libkadm5clnt-mit11"
-DEPENDS="${DEPENDS}, libldap-2.5-0, libssl3, ${CURL_PKG}, ${BOOST_PKG}"
+DEPENDS="${DEPENDS}, ${LDAP_PKG}, libssl3t64, ${CURL_PKG}, ${BOOST_PKG},${BOOST_DATETIME_PKG}"
 
 cat > "${DEBIAN_DIR}/control" << EOF
 Package: ${PACKAGE_NAME}

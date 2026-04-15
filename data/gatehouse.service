@@ -19,6 +19,10 @@ ReadWritePaths=/var/lib/gatehouse
 ProtectSystem=strict
 ProtectHome=yes
 NoNewPrivileges=yes
+# krb5_cc_new_unique(FILE) legt temporäre ccache-Dateien in /tmp an.
+# PrivateTmp=yes stellt eine private, beschreibbare tmpfs bereit,
+# damit das unter ProtectSystem=strict funktioniert.
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

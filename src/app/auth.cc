@@ -1,9 +1,11 @@
 #include "app/auth.h"
 
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <utility>
 
+#include "app/http_utils.h"
 #include "infra/krb5_client.h"
 
 namespace gatehouse::app {
@@ -28,6 +30,9 @@ core::Result<std::optional<LoginPrincipal>> AuthService::Verify(const LoginReque
   infra::Krb5Client krb(infra::Krb5Config{.realm = cfg_.krb5_realm});
   auto vr = krb.VerifyPasswordAndGetCcache(req.username, req.password);
   if (!vr.ok()) {
+    std::fprintf(stderr, "[gatehouse][auth] krb5 error user='%s': %s\n",
+                 SanitizeForLog(req.username).c_str(),
+                 vr.status().ToString().c_str());
     return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
   }
 

@@ -1,5 +1,6 @@
 #include "app/routes.h"
 
+#include <cstdio>
 #include <string>
 
 #include "app/http_utils.h"
@@ -82,6 +83,8 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
     if (!ctx.rate_limiter.Check(req.remote_ip_address)) {
+      std::fprintf(stderr, "[gatehouse][login] rate-limited ip=%s\n",
+                   SanitizeForLog(req.remote_ip_address).c_str());
       return RedirectTo(B + "/login?err=Too+many+login+attempts.+Please+try+again+in+5+minutes.");
     }
 
@@ -93,7 +96,12 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     lr.password = p.value_or("");
 
     auto vr = ctx.auth.Verify(lr);
-    if (!vr.ok() || !vr.value().has_value()) return RedirectTo(B + "/login?err=Invalid+credentials");
+    if (!vr.ok() || !vr.value().has_value()) {
+      std::fprintf(stderr, "[gatehouse][login] failed user='%s' ip=%s\n",
+                   SanitizeForLog(lr.username).c_str(),
+                   SanitizeForLog(req.remote_ip_address).c_str());
+      return RedirectTo(B + "/login?err=Invalid+credentials");
+    }
 
     LoginPrincipal principal = *vr.value();
     if (ctx.ldap_dir.has_value()) {
@@ -103,11 +111,22 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       }
     }
     auto ticket_id = StoreTicketIfPresent(ctx, principal);
-    if (!ticket_id.ok()) return RedirectTo(B + "/login?err=Internal+error");
+    if (!ticket_id.ok()) {
+      std::fprintf(stderr, "[gatehouse][login] ticket storage failed uid='%s': %s\n",
+                   SanitizeForLog(principal.uid).c_str(),
+                   ticket_id.status().ToString().c_str());
+      return RedirectTo(B + "/login?err=Internal+error");
+    }
 
     auto sid_bytes = core::RandomBytes(32);
     auto csrf_bytes = core::RandomBytes(32);
-    if (!sid_bytes.ok() || !csrf_bytes.ok()) return RedirectTo(B + "/login?err=Internal+error");
+    if (!sid_bytes.ok() || !csrf_bytes.ok()) {
+      std::fprintf(stderr, "[gatehouse][login] random bytes failed uid='%s': %s\n",
+                   SanitizeForLog(principal.uid).c_str(),
+                   (!sid_bytes.ok() ? sid_bytes.status().ToString()
+                                    : csrf_bytes.status().ToString()).c_str());
+      return RedirectTo(B + "/login?err=Internal+error");
+    }
 
     infra::SessionRow row;
     row.sid = core::HexEncode(sid_bytes.value());
@@ -120,8 +139,16 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     const std::vector<std::uint8_t> ip_hash = HashRemoteIp(req.remote_ip_address);
     auto ins = ctx.sessions.Insert(row, csrf_bytes.value(), ip_hash);
-    if (!ins.ok()) return RedirectTo(B + "/login?err=Internal+error");
+    if (!ins.ok()) {
+      std::fprintf(stderr, "[gatehouse][login] session insert failed uid='%s': %s\n",
+                   SanitizeForLog(row.uid).c_str(),
+                   ins.status().ToString().c_str());
+      return RedirectTo(B + "/login?err=Internal+error");
+    }
 
+    std::fprintf(stderr, "[gatehouse][login] ok uid='%s' tenant='%s' ip=%s\n",
+                 row.uid.c_str(), row.tenant_id.c_str(),
+                 SanitizeForLog(req.remote_ip_address).c_str());
     auto r = RedirectTo(B + "/portal");
     r.add_header("Set-Cookie",
                  ctx.cfg.session_cookie_name + "=" + row.sid +
@@ -137,6 +164,8 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
     if (!ctx.rate_limiter.Check(req.remote_ip_address)) {
+      std::fprintf(stderr, "[gatehouse][api/login] rate-limited ip=%s\n",
+                   SanitizeForLog(req.remote_ip_address).c_str());
       crow::json::wvalue v; v["ok"]=false; v["error"]="too many login attempts"; return Json(429, v);
     }
 
@@ -151,6 +180,9 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     auto vr = ctx.auth.Verify(lr);
     if (!vr.ok() || !vr.value().has_value()) {
+      std::fprintf(stderr, "[gatehouse][api/login] failed user='%s' ip=%s\n",
+                   SanitizeForLog(lr.username).c_str(),
+                   SanitizeForLog(req.remote_ip_address).c_str());
       crow::json::wvalue v; v["ok"]=false; v["error"]="invalid credentials"; return Json(401, v);
     }
 
@@ -163,12 +195,19 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     }
     auto ticket_id = StoreTicketIfPresent(ctx, principal);
     if (!ticket_id.ok()) {
+      std::fprintf(stderr, "[gatehouse][api/login] ticket storage failed uid='%s': %s\n",
+                   SanitizeForLog(principal.uid).c_str(),
+                   ticket_id.status().ToString().c_str());
       crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
     }
 
     auto sid_bytes = core::RandomBytes(32);
     auto csrf_bytes = core::RandomBytes(32);
     if (!sid_bytes.ok() || !csrf_bytes.ok()) {
+      std::fprintf(stderr, "[gatehouse][api/login] random bytes failed uid='%s': %s\n",
+                   SanitizeForLog(principal.uid).c_str(),
+                   (!sid_bytes.ok() ? sid_bytes.status().ToString()
+                                    : csrf_bytes.status().ToString()).c_str());
       crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
     }
 
@@ -184,9 +223,15 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::vector<std::uint8_t> ip_hash = HashRemoteIp(req.remote_ip_address);
     auto ins = ctx.sessions.Insert(row, csrf_bytes.value(), ip_hash);
     if (!ins.ok()) {
+      std::fprintf(stderr, "[gatehouse][api/login] session insert failed uid='%s': %s\n",
+                   SanitizeForLog(row.uid).c_str(),
+                   ins.status().ToString().c_str());
       crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
     }
 
+    std::fprintf(stderr, "[gatehouse][api/login] ok uid='%s' tenant='%s' ip=%s\n",
+                 row.uid.c_str(), row.tenant_id.c_str(),
+                 SanitizeForLog(req.remote_ip_address).c_str());
     crow::json::wvalue v;
     v["ok"] = true;
     v["uid"] = row.uid;
