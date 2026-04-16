@@ -65,6 +65,162 @@ Result<std::vector<std::uint8_t>> Aes128CbcEncrypt(
   return Result<std::vector<std::uint8_t>>::Ok(std::move(result));
 }
 
+Result<std::vector<std::uint8_t>> Aes128CbcEncryptWithIv(
+    const std::vector<std::uint8_t>& key16,
+    const std::vector<std::uint8_t>& iv16,
+    const std::vector<std::uint8_t>& plaintext) {
+  if (key16.size() != 16) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInvalidArgument, "key16 must be exactly 16 bytes"));
+  }
+  if (iv16.size() != 16) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInvalidArgument, "iv16 must be exactly 16 bytes"));
+  }
+
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (ctx == nullptr) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_CIPHER_CTX_new failed"));
+  }
+
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), nullptr,
+                         key16.data(), iv16.data()) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptInit_ex failed"));
+  }
+
+  std::vector<std::uint8_t> ciphertext(plaintext.size() + 16);
+  int len = 0;
+  if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
+                        plaintext.data(),
+                        static_cast<int>(plaintext.size())) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptUpdate failed"));
+  }
+  int total = len;
+
+  int final_len = 0;
+  if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &final_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptFinal_ex failed"));
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  total += final_len;
+  ciphertext.resize(static_cast<std::size_t>(total));
+  return Result<std::vector<std::uint8_t>>::Ok(std::move(ciphertext));
+}
+
+Result<std::vector<std::uint8_t>> AesCbcEncrypt(
+    const std::vector<std::uint8_t>& key,
+    const std::vector<std::uint8_t>& plaintext) {
+  const EVP_CIPHER* cipher = nullptr;
+  switch (key.size()) {
+    case 16: cipher = EVP_aes_128_cbc(); break;
+    case 24: cipher = EVP_aes_192_cbc(); break;
+    case 32: cipher = EVP_aes_256_cbc(); break;
+    default:
+      return Result<std::vector<std::uint8_t>>::Err(
+          Status::Error(StatusCode::kInvalidArgument, "key must be 16, 24, or 32 bytes"));
+  }
+
+  std::vector<std::uint8_t> iv(16);
+  if (RAND_bytes(iv.data(), 16) != 1) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "RAND_bytes failed"));
+  }
+
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (ctx == nullptr) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_CIPHER_CTX_new failed"));
+  }
+  if (EVP_EncryptInit_ex(ctx, cipher, nullptr, key.data(), iv.data()) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptInit_ex failed"));
+  }
+
+  std::vector<std::uint8_t> ciphertext(plaintext.size() + 16);
+  int len = 0;
+  if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
+                        plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptUpdate failed"));
+  }
+  int total = len;
+  int final_len = 0;
+  if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &final_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptFinal_ex failed"));
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  total += final_len;
+  ciphertext.resize(static_cast<std::size_t>(total));
+
+  // Result = IV (16 bytes) || ciphertext
+  std::vector<std::uint8_t> result;
+  result.reserve(16 + ciphertext.size());
+  result.insert(result.end(), iv.begin(), iv.end());
+  result.insert(result.end(), ciphertext.begin(), ciphertext.end());
+  return Result<std::vector<std::uint8_t>>::Ok(std::move(result));
+}
+
+Result<std::vector<std::uint8_t>> AesCbcEncryptWithIv(
+    const std::vector<std::uint8_t>& key,
+    const std::vector<std::uint8_t>& iv16,
+    const std::vector<std::uint8_t>& plaintext) {
+  if (iv16.size() != 16) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInvalidArgument, "iv16 must be exactly 16 bytes"));
+  }
+  const EVP_CIPHER* cipher = nullptr;
+  switch (key.size()) {
+    case 16: cipher = EVP_aes_128_cbc(); break;
+    case 24: cipher = EVP_aes_192_cbc(); break;
+    case 32: cipher = EVP_aes_256_cbc(); break;
+    default:
+      return Result<std::vector<std::uint8_t>>::Err(
+          Status::Error(StatusCode::kInvalidArgument, "key must be 16, 24, or 32 bytes"));
+  }
+
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (ctx == nullptr) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_CIPHER_CTX_new failed"));
+  }
+  if (EVP_EncryptInit_ex(ctx, cipher, nullptr, key.data(), iv16.data()) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptInit_ex failed"));
+  }
+
+  std::vector<std::uint8_t> ciphertext(plaintext.size() + 16);
+  int len = 0;
+  if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
+                        plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptUpdate failed"));
+  }
+  int total = len;
+  int final_len = 0;
+  if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &final_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "EVP_EncryptFinal_ex failed"));
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  total += final_len;
+  ciphertext.resize(static_cast<std::size_t>(total));
+  return Result<std::vector<std::uint8_t>>::Ok(std::move(ciphertext));
+}
+
 namespace {
 constexpr const char kB64Chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -21,14 +21,36 @@ namespace gatehouse::app {
 
 namespace {
 
-// Derives a 16-byte AES-128 key from the guacamole secret:
-// takes the first 16 UTF-8 bytes, zero-pads if shorter (mirrors Java Arrays.copyOf).
-std::vector<std::uint8_t> DeriveGuacKey(const std::string& secret) {
-  std::vector<std::uint8_t> key(16, 0);
-  for (std::size_t i = 0; i < 16 && i < secret.size(); ++i) {
-    key[i] = static_cast<std::uint8_t>(secret[i]);
+// Derives key material from the guacamole secret.
+// If the secret is valid hex (as Guacamole's json-secret-key requires), it is
+// hex-decoded.  Otherwise raw UTF-8 bytes are used as fallback.
+// Returns the full decoded bytes — callers truncate as needed.
+std::vector<std::uint8_t> DecodeGuacSecret(const std::string& secret) {
+  auto decoded = core::HexDecode(secret);
+  if (decoded.ok() && !decoded.value().empty()) {
+    return decoded.value();
   }
-  return key;
+  return std::vector<std::uint8_t>(secret.begin(), secret.end());
+}
+
+// Percent-encodes characters that are unsafe in a query-string value.
+// Standard Base64 uses '+', '/', '=' — '+' in particular is decoded as space
+// by URL parsers, which breaks Guacamole's base64 decoding.
+std::string UrlEncodeParam(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() * 3);
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+    } else {
+      char buf[4];
+      std::snprintf(buf, sizeof(buf), "%%%02X", static_cast<unsigned>(c));
+      out += buf;
+    }
+  }
+  return out;
 }
 
 // Escapes a string for safe embedding in a JSON string literal.
@@ -72,7 +94,9 @@ core::Result<std::string> BuildGuacUrl(
   json += "\"hostname\":\"" + JsonStr(host_ip.empty() ? hostname : host_ip) + "\",";
   json += "\"port\":\"" + port + "\",";
   json += "\"username\":\"" + JsonStr(uid) + "\",";
-  json += "\"password\":\"" + JsonStr(token_hex) + "\"";
+  json += "\"password\":\"" + JsonStr(token_hex) + "\",";
+  json += "\"security\":\"rdp\",";
+  json += "\"ignore-cert\":\"true\"";
   json += "}}}";
   json += "}";
 
@@ -80,17 +104,53 @@ core::Result<std::string> BuildGuacUrl(
                uid.c_str(), hostname.c_str(), json.c_str());
 
   const std::vector<std::uint8_t> plaintext(json.begin(), json.end());
-  const std::vector<std::uint8_t> key = DeriveGuacKey(guacamole_secret);
 
-  auto enc = core::Aes128CbcEncrypt(key, plaintext);
+  // Guacamole encrypted JSON format (matches Java UserDataService):
+  //   1. full_key = HexDecode(secret)        — key length determines AES variant
+  //   2. HMAC = HmacSHA256(full_key, json)   — 32-byte signature
+  //   3. signed_payload = HMAC || json
+  //   4. encrypt = AesCBC(full_key, random_IV, signed_payload)
+  //   5. output = Base64(random_IV[16] || ciphertext)
+  const std::vector<std::uint8_t> full_key = DecodeGuacSecret(guacamole_secret);
+
+  // Log key for diagnostics.
+  {
+    std::string k;
+    for (std::uint8_t b : full_key) { char buf[3]; std::snprintf(buf,3,"%02x",b); k+=buf; }
+    std::fprintf(stderr, "[gatehouse][guac] secret_len=%zu full_key_len=%zu full_key=%s\n",
+                 guacamole_secret.size(), full_key.size(), k.c_str());
+  }
+
+  // Step 1: HMAC-SHA256 of JSON bytes, keyed with the full decoded key.
+  auto hmac = core::HmacSha256(full_key, plaintext);
+  if (!hmac.ok()) return core::Result<std::string>::Err(hmac.status());
+
+  // Step 2: signed_payload = HMAC(32 bytes) || json.
+  std::vector<std::uint8_t> signed_payload;
+  signed_payload.reserve(32 + plaintext.size());
+  signed_payload.insert(signed_payload.end(), hmac.value().begin(), hmac.value().end());
+  signed_payload.insert(signed_payload.end(), plaintext.begin(), plaintext.end());
+
+  // Step 3: AES-CBC with null IV, key-size-agnostic (32 bytes → AES-256).
+  // Java's CryptoService.decrypt() uses a hardcoded NULL_IV; the ciphertext
+  // is the entire base64-decoded payload — no IV prepended.
+  const std::vector<std::uint8_t> null_iv(16, 0);
+  auto enc = core::AesCbcEncryptWithIv(full_key, null_iv, signed_payload);
   if (!enc.ok()) return core::Result<std::string>::Err(enc.status());
+
+  std::fprintf(stderr, "[gatehouse][guac] signed_payload_len=%zu encrypted_len=%zu\n",
+               signed_payload.size(), enc.value().size());
 
   const std::string data = core::Base64Encode(enc.value());
 
-  // URL-encode the data parameter (Base64URL chars are all URL-safe; no encoding needed)
+  std::fprintf(stderr, "[gatehouse][guac] base64 payload for uid=%s host=%s: %s\n",
+               uid.c_str(), hostname.c_str(), data.c_str());
+
+  // Percent-encode the data parameter: standard Base64 contains '+' which URL
+  // parsers decode as space, corrupting the payload before Guacamole sees it.
   std::string url = guacamole_url;
   if (!url.empty() && url.back() == '/') url.pop_back();
-  url += "/#/?data=" + data;
+  url += "/#/?data=" + UrlEncodeParam(data);
 
   return core::Result<std::string>::Ok(std::move(url));
 }

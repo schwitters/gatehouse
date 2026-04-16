@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 namespace gatehouse::core {
 
@@ -41,6 +42,24 @@ Result<std::vector<std::uint8_t>> Sha256(const std::vector<std::uint8_t>& data) 
 
   EVP_MD_CTX_free(ctx);
   return Result<std::vector<std::uint8_t>>::Ok(std::vector<std::uint8_t>(out, out + 32));
+}
+
+Result<std::vector<std::uint8_t>> HmacSha256(
+    const std::vector<std::uint8_t>& key,
+    const std::vector<std::uint8_t>& data) {
+  unsigned char out[32];
+  unsigned int out_len = 32;
+  const unsigned char* result = HMAC(
+      EVP_sha256(),
+      key.data(), static_cast<int>(key.size()),
+      data.data(), data.size(),
+      out, &out_len);
+  if (result == nullptr || out_len != 32) {
+    return Result<std::vector<std::uint8_t>>::Err(
+        Status::Error(StatusCode::kInternal, "HMAC failed"));
+  }
+  return Result<std::vector<std::uint8_t>>::Ok(
+      std::vector<std::uint8_t>(out, out + 32));
 }
 
 std::string Base64UrlNoPad(const std::vector<std::uint8_t>& data) {
