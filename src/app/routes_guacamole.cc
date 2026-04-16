@@ -98,7 +98,7 @@ core::Result<std::string> BuildGuacUrl(
   json += "\"security\":\"rdp\",";
   json += "\"ignore-cert\":\"true\",";
   json += "\"server-layout\":\"de-de-qwertz\",";
-  json += "\"resize-method\":\"display-update\"";
+  json += "\"resize-method\":\"reconnect\"";
   json += "}}}";
   json += "}";
 
