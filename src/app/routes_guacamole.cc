@@ -85,7 +85,7 @@ core::Result<std::string> BuildGuacUrl(
   auto enc = core::Aes128CbcEncrypt(key, plaintext);
   if (!enc.ok()) return core::Result<std::string>::Err(enc.status());
 
-  const std::string data = core::Base64UrlEncode(enc.value());
+  const std::string data = core::Base64Encode(enc.value());
 
   // URL-encode the data parameter (Base64URL chars are all URL-safe; no encoding needed)
   std::string url = guacamole_url;
