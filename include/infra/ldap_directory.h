@@ -45,6 +45,7 @@ class LdapDirectory final {
     std::string dn;
     std::string hostname;
     std::string ip;
+    std::string protocol;  // "rdp" or "ssh", derived from hostname prefix
   };
 
   struct LdapUserDetail {

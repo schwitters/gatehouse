@@ -337,6 +337,16 @@ core::Result<std::optional<std::string>> FindUserDnByUid(const LdapConfig& cfg,
   return core::Result<std::optional<std::string>>::Ok(GetEntryDn(ld, entry));
 }
 
+// Derive connection protocol from a host CN of the form "{svc}-{uid}".
+// Hostnames starting with "rdp" or "dsk" indicate a Remote Desktop host;
+// everything else is reachable via SSH.
+std::string ProtocolFromHostname(const std::string& cn) {
+  const auto dash = cn.find('-');
+  const std::string svc = (dash != std::string::npos) ? cn.substr(0, dash) : cn;
+  if (svc == "rdp" || svc == "dsk") return "rdp";
+  return "ssh";
+}
+
 }  // namespace
 
 LdapDirectory::LdapDirectory(LdapConfig cfg) : cfg_(std::move(cfg)) {}
@@ -784,7 +794,8 @@ core::Result<std::vector<LdapDirectory::LdapHost>> LdapDirectory::GetUserHosts(
     std::optional<std::string> cn_val =
         GetFirstAttributeValue(ld.get(), host_entry, "cn");
     if (cn_val.has_value()) {
-      host.hostname = std::move(*cn_val);
+      host.hostname = *cn_val;
+      host.protocol = ProtocolFromHostname(*cn_val);
     }
 
     std::optional<std::string> ip_val =
@@ -1010,7 +1021,10 @@ core::Result<std::vector<LdapDirectory::LdapUserDetail>> LdapDirectory::ListUser
       host.dn = host_dn;
 
       std::optional<std::string> cn = GetFirstAttributeValue(ld.get(), host_entry, "cn");
-      if (cn.has_value()) host.hostname = std::move(*cn);
+      if (cn.has_value()) {
+        host.hostname = *cn;
+        host.protocol = ProtocolFromHostname(*cn);
+      }
 
       std::optional<std::string> ip = GetFirstAttributeValue(ld.get(), host_entry, "ipHostNumber");
       if (!ip.has_value()) ip = GetFirstAttributeValue(ld.get(), host_entry, "aRecord");

@@ -76,6 +76,9 @@ core::Result<std::string> BuildGuacUrl(
   json += "}}}";
   json += "}";
 
+  std::fprintf(stderr, "[gatehouse][guac] plaintext JSON for uid=%s host=%s: %s\n",
+               uid.c_str(), hostname.c_str(), json.c_str());
+
   const std::vector<std::uint8_t> plaintext(json.begin(), json.end());
   const std::vector<std::uint8_t> key = DeriveGuacKey(guacamole_secret);
 

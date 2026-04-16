@@ -104,7 +104,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "    const code = document.createElement('code');";
     html += "    code.textContent = host.ip || 'No IP configured';";
     html += "    p.appendChild(code);";
-    html += "    const proto=(host.hostname&&host.hostname.toLowerCase().includes('xrdp'))?'rdp':'ssh';";
+    html += "    const proto=(host.protocol==='rdp')?'rdp':'ssh';";
     html += "    const btn=document.createElement('button');";
     html += "    btn.textContent=(proto==='rdp')?'Connect (RDP)':'Connect (SSH)';";
     html += "    btn.style.cssText='margin-top:10px;padding:6px 12px;font-size:0.85em;width:100%;background:#1a6b38';";
@@ -224,6 +224,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       it["hostname"] = h.hostname;
       it["ip"] = h.ip;
       it["dn"] = h.dn;
+      it["protocol"] = h.protocol;
       v["items"][idx++] = std::move(it);
     }
     return Json(200, v);
