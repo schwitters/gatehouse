@@ -84,6 +84,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "    body:JSON.stringify({hostname:hostname,protocol:protocol})});";
     html += "  const j=await r.json();";
     html += "  if(!r.ok||!j.ok){alert('Connect failed: '+(j.error||r.status));return;}";
+    html += "  try{localStorage.removeItem('GUAC_AUTH');}catch(e){}";
     html += "  window.open(j.url,'_blank');";
     html += "}";
     html += "async function loadHosts() {";

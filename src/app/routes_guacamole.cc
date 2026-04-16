@@ -96,7 +96,8 @@ core::Result<std::string> BuildGuacUrl(
   json += "\"username\":\"" + JsonStr(uid) + "\",";
   json += "\"password\":\"" + JsonStr(token_hex) + "\",";
   json += "\"security\":\"rdp\",";
-  json += "\"ignore-cert\":\"true\"";
+  json += "\"ignore-cert\":\"true\",";
+  json += "\"server-layout\":\"de-de-qwertz\"";
   json += "}}}";
   json += "}";
 
