@@ -90,18 +90,44 @@ core::Result<std::string> BuildGuacUrl(
   json += "\"connections\":{";
   json += "\"" + JsonStr(hostname) + "\":{";
   json += "\"protocol\":\"" + JsonStr(protocol) + "\",";
+
+  // --- Start Parameters ---
   json += "\"parameters\":{";
-  json += "\"hostname\":\"" + JsonStr(host_ip.empty() ? hostname : host_ip) + "\",";
-  json += "\"port\":\"" + port + "\",";
-  json += "\"username\":\"" + JsonStr(uid) + "\",";
-  json += "\"password\":\"" + JsonStr(token_hex) + "\",";
-  json += "\"security\":\"rdp\",";
-  json += "\"ignore-cert\":\"true\",";
-  json += "\"server-layout\":\"de-de-qwertz\",";
-  json += "\"width\":\"1920\",";
-  json += "\"height\":\"1080\"";
-  json += "}}}";
+  json += "  \"hostname\":\"" + JsonStr(host_ip.empty() ? hostname : host_ip) + "\",";
+  json += "  \"port\":\"" + port + "\",";
+  json += "  \"username\":\"" + JsonStr(uid) + "\",";
+  json += "  \"password\":\"" + JsonStr(token_hex) + "\",";
+  json += "  \"security\":\"rdp\",";
+  json += "  \"ignore-cert\":\"true\",";
+  json += "  \"server-layout\":\"de-de-qwertz\",";
+  json += "  \"width\":\"1920\",";
+  json += "  \"height\":\"1080\"";
+  json += "},"; // <--- IMPORTANT: The comma indicates another key follows!
+
+  // --- NEW: Start sharingProfiles ---
+  json += "\"sharingProfiles\":{";
+
+  // Profile 1: View Only (Read-Only)
+  json += "  \"View-Only\":{";
+  json += "    \"parameters\":{";
+  json += "      \"read-only\":\"true\"";
+  json += "    }";
+  json += "  },"; // <--- Comma separates the profiles
+
+  // Profile 2: Full Access (Collaboration)
+  json += "  \"Full-Access\":{";
+  json += "    \"parameters\":{";
+  json += "      \"read-only\":\"false\"";
+  json += "    }";
+  json += "  }"; // <--- No comma after the last profile in this block
+
   json += "}";
+  // --- END sharingProfiles ---
+
+  // Close remaining containers
+  json += "}}"; // Closes the specific connection object AND the "connections" object
+  json += "}";  // Closes the root object
+		//
 
   std::fprintf(stderr, "[gatehouse][guac] plaintext JSON for uid=%s host=%s: %s\n",
                uid.c_str(), hostname.c_str(), json.c_str());
