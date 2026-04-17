@@ -61,6 +61,8 @@ install -m 640 "${PROJECT_ROOT}/data/gatehouse.env.example" \
 # dpkg merkt Änderungen und fragt beim Upgrade nach.
 install -m 640 "${PROJECT_ROOT}/data/gatehouse.env.example" \
     "${STAGING_DIR}/etc/gatehouse/gatehouse.env"
+install -m 644 "${PROJECT_ROOT}/config/guac_connection_template.json" \
+    "${STAGING_DIR}/etc/gatehouse/guac_connection_template.json"
 
 # Laufzeit-Zustandsverzeichnis (per postinst angelegt)
 install -d -m 750 "${STAGING_DIR}/var/lib/gatehouse"

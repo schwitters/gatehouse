@@ -56,9 +56,12 @@ struct HttpServerConfig {
   // guacamole_url: base URL of the Guacamole web app (e.g. https://guac.example.com).
   // guacamole_secret: shared secret; first 16 UTF-8 bytes used as AES-128-CBC key.
   // guac_token_ttl_seconds: credential-fetch token lifetime (default: 60 s).
+  // guac_connection_template_path: path to a JSON template file with {{PLACEHOLDER}}
+  //   substitution markers; if empty the built-in default template is used.
   std::string guacamole_url;
   std::string guacamole_secret;
   std::int64_t guac_token_ttl_seconds{60};
+  std::string guac_connection_template_path;
 
   // URL path prefix for hosting under a sub-path (e.g. "/gatehouse").
   // Must start with '/' or be empty. Must not end with '/'.

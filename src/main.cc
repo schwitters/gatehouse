@@ -47,9 +47,11 @@ void PrintUsage(const char* argv0) {
       << "  --ldap-starttls        Upgrade LDAP connection with StartTLS\n"
       << "\n"
       << "Guacamole:\n"
-      << "  --guacamole-url URL    Guacamole web app base URL (enables Connect buttons)\n"
-      << "  --guacamole-secret S   Shared secret for Guacamole Encrypted JSON auth\n"
-      << "  --guac-token-ttl SECS  Credential-fetch token lifetime (default: 60)\n"
+      << "  --guacamole-url URL          Guacamole web app base URL (enables Connect buttons)\n"
+      << "  --guacamole-secret S         Shared secret for Guacamole Encrypted JSON auth\n"
+      << "  --guac-token-ttl SECS        Credential-fetch token lifetime (default: 60)\n"
+      << "  --guac-connection-template P Path to Guacamole connection JSON template\n"
+      << "                               (default: built-in; see config/guac_connection_template.json)\n"
       << "\n"
       << "Security:\n"
       << "  --secure-cookies       Set Secure flag on session cookies (use with HTTPS/reverse proxy)\n"
@@ -163,6 +165,7 @@ int main(int argc, char** argv) {
     // Guacamole
     if (arg == "--guacamole-url" && i + 1 < argc) { cfg.guacamole_url = argv[++i]; continue; }
     if (arg == "--guacamole-secret" && i + 1 < argc) { cfg.guacamole_secret = argv[++i]; continue; }
+    if (arg == "--guac-connection-template" && i + 1 < argc) { cfg.guac_connection_template_path = argv[++i]; continue; }
     if (arg == "--guac-token-ttl" && i + 1 < argc) {
       std::int64_t ttl{};
       if (!ParseI64(argv[++i], &ttl) || ttl <= 0) { std::cerr << "Invalid --guac-token-ttl\n"; return 2; }

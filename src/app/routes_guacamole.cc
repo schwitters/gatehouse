@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -68,6 +70,55 @@ std::string JsonStr(const std::string& s) {
   return out;
 }
 
+// Built-in fallback template — used when no external template file is configured.
+// Mirrors the structure of config/guac_connection_template.json.
+const std::string kDefaultConnectionTemplate = R"({"username":"{{USERNAME}}","expires":{{EXPIRES_MS}},"connections":{"{{HOSTNAME}}":{"protocol":"{{PROTOCOL}}","parameters":{"hostname":"{{HOST_IP}}","port":"{{PORT}}","username":"{{USERNAME}}","password":"{{PASSWORD}}","security":"rdp","ignore-cert":"true","server-layout":"de-de-qwertz","width":"1920","height":"1080"},"sharingProfiles":{"View-Only":{"parameters":{"read-only":"true"}},"Full-Access":{"parameters":{"read-only":"false"}}}}}})";
+
+// Loads a template from disk; returns the built-in default on empty path or I/O error.
+std::string LoadConnectionTemplate(const std::string& path) {
+  if (path.empty()) return kDefaultConnectionTemplate;
+  std::ifstream f(path);
+  if (!f.is_open()) {
+    std::fprintf(stderr, "[gatehouse][guac] could not open template %s, using built-in\n",
+                 path.c_str());
+    return kDefaultConnectionTemplate;
+  }
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// Replaces all occurrences of `from` with `to` in `s`.
+std::string ReplaceAll(std::string s, const std::string& from, const std::string& to) {
+  std::size_t pos = 0;
+  while ((pos = s.find(from, pos)) != std::string::npos) {
+    s.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+  return s;
+}
+
+// Substitutes {{PLACEHOLDER}} markers in a Guacamole connection JSON template.
+// String values are JSON-escaped; numeric values (EXPIRES_MS) are inserted as-is.
+std::string SubstitutePlaceholders(
+    std::string tmpl,
+    const std::string& username,
+    const std::string& password,
+    const std::string& hostname,
+    const std::string& host_ip,
+    const std::string& protocol,
+    const std::string& port,
+    std::int64_t expires_ms) {
+  tmpl = ReplaceAll(tmpl, "{{USERNAME}}",   JsonStr(username));
+  tmpl = ReplaceAll(tmpl, "{{PASSWORD}}",   JsonStr(password));
+  tmpl = ReplaceAll(tmpl, "{{HOSTNAME}}",   JsonStr(hostname));
+  tmpl = ReplaceAll(tmpl, "{{HOST_IP}}",    JsonStr(host_ip));
+  tmpl = ReplaceAll(tmpl, "{{PROTOCOL}}",   JsonStr(protocol));
+  tmpl = ReplaceAll(tmpl, "{{PORT}}",       JsonStr(port));
+  tmpl = ReplaceAll(tmpl, "{{EXPIRES_MS}}", std::to_string(expires_ms));
+  return tmpl;
+}
+
 // Builds the Guacamole Encrypted JSON payload and returns the full redirect URL.
 // protocol must be "rdp" or "ssh".
 core::Result<std::string> BuildGuacUrl(
@@ -78,56 +129,18 @@ core::Result<std::string> BuildGuacUrl(
     const std::string& host_ip,
     const std::string& protocol,
     const std::string& token_hex,
-    std::int64_t expires_unix_s) {
+    std::int64_t expires_unix_s,
+    const std::string& connection_template) {
 
   const std::string port = (protocol == "rdp") ? "3389" : "22";
-  // expires in Guacamole is milliseconds since epoch
   const std::int64_t expires_ms = expires_unix_s * 1000;
+  const std::string effective_host = host_ip.empty() ? hostname : host_ip;
 
-  std::string json = "{";
-  json += "\"username\":\"" + JsonStr(uid) + "\",";
-  json += "\"expires\":" + std::to_string(expires_ms) + ",";
-  json += "\"connections\":{";
-  json += "\"" + JsonStr(hostname) + "\":{";
-  json += "\"protocol\":\"" + JsonStr(protocol) + "\",";
+  const std::string json = SubstitutePlaceholders(
+      connection_template, uid, token_hex, hostname, effective_host,
+      protocol, port, expires_ms);
 
-  // --- Start Parameters ---
-  json += "\"parameters\":{";
-  json += "  \"hostname\":\"" + JsonStr(host_ip.empty() ? hostname : host_ip) + "\",";
-  json += "  \"port\":\"" + port + "\",";
-  json += "  \"username\":\"" + JsonStr(uid) + "\",";
-  json += "  \"password\":\"" + JsonStr(token_hex) + "\",";
-  json += "  \"security\":\"rdp\",";
-  json += "  \"ignore-cert\":\"true\",";
-  json += "  \"server-layout\":\"de-de-qwertz\",";
-  json += "  \"width\":\"1920\",";
-  json += "  \"height\":\"1080\"";
-  json += "},"; // <--- IMPORTANT: The comma indicates another key follows!
 
-  // --- NEW: Start sharingProfiles ---
-  json += "\"sharingProfiles\":{";
-
-  // Profile 1: View Only (Read-Only)
-  json += "  \"View-Only\":{";
-  json += "    \"parameters\":{";
-  json += "      \"read-only\":\"true\"";
-  json += "    }";
-  json += "  },"; // <--- Comma separates the profiles
-
-  // Profile 2: Full Access (Collaboration)
-  json += "  \"Full-Access\":{";
-  json += "    \"parameters\":{";
-  json += "      \"read-only\":\"false\"";
-  json += "    }";
-  json += "  }"; // <--- No comma after the last profile in this block
-
-  json += "}";
-  // --- END sharingProfiles ---
-
-  // Close remaining containers
-  json += "}}"; // Closes the specific connection object AND the "connections" object
-  json += "}";  // Closes the root object
-		//
 
   std::fprintf(stderr, "[gatehouse][guac] plaintext JSON for uid=%s host=%s: %s\n",
                uid.c_str(), hostname.c_str(), json.c_str());
@@ -188,6 +201,8 @@ core::Result<std::string> BuildGuacUrl(
 
 void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   const std::string& B = ctx.cfg.base_uri;
+  const std::string connection_template =
+      LoadConnectionTemplate(ctx.cfg.guac_connection_template_path);
 
   // ---- POST /api/me/guacamole-session ----
   // Creates a short-lived credential-fetch token, builds a Guacamole Encrypted
@@ -196,7 +211,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // Request body (JSON): {"hostname": "...", "protocol": "rdp"|"ssh"}
   // Response (JSON):     {"ok": true, "url": "..."}
   app.route_dynamic(B + "/api/me/guacamole-session")
-      .methods("POST"_method)([&ctx](const crow::request& req) {
+      .methods("POST"_method)([&ctx, connection_template](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"] = false; v["error"] = "unauthenticated";
@@ -296,7 +311,8 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     auto url_res = BuildGuacUrl(
         ctx.cfg.guacamole_url, ctx.cfg.guacamole_secret,
-        s->uid, hostname, host_ip, protocol, token_hex, expires);
+        s->uid, hostname, host_ip, protocol, token_hex, expires,
+        connection_template);
     if (!url_res.ok()) {
       crow::json::wvalue v; v["ok"] = false; v["error"] = url_res.status().ToString();
       return Json(500, v);

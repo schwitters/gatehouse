@@ -1,0 +1,32 @@
+{
+  "username": "{{USERNAME}}",
+  "expires": {{EXPIRES_MS}},
+  "connections": {
+    "{{HOSTNAME}}": {
+      "protocol": "{{PROTOCOL}}",
+      "parameters": {
+        "hostname": "{{HOST_IP}}",
+        "port": "{{PORT}}",
+        "username": "{{USERNAME}}",
+        "password": "{{PASSWORD}}",
+        "security": "rdp",
+        "ignore-cert": "true",
+        "server-layout": "de-de-qwertz",
+        "width": "1920",
+        "height": "1080"
+      },
+      "sharingProfiles": {
+        "View-Only": {
+          "parameters": {
+            "read-only": "true"
+          }
+        },
+        "Full-Access": {
+          "parameters": {
+            "read-only": "false"
+          }
+        }
+      }
+    }
+  }
+}
