@@ -114,6 +114,13 @@ std::optional<infra::InviteSessionRow> RequireInviteSession(
 bool IsAdminUid(ServerContext& ctx, const std::string& uid) {
   if (!ctx.cfg.ldap_admin_group.empty() && ctx.ldap_dir.has_value()) {
     auto rc = ctx.ldap_dir->IsUserInGroup(uid, ctx.cfg.ldap_admin_group);
+    if (!rc.ok()) {
+      std::fprintf(stderr, "[gatehouse][admin] IsUserInGroup uid='%s' group='%s' error: %s\n",
+                   uid.c_str(), ctx.cfg.ldap_admin_group.c_str(), rc.status().ToString().c_str());
+    } else {
+      std::fprintf(stderr, "[gatehouse][admin] IsUserInGroup uid='%s' result=%s\n",
+                   uid.c_str(), rc.value() ? "true" : "false");
+    }
     if (rc.ok() && rc.value()) return true;
   }
   for (const auto& a : ctx.cfg.admin_uids) {

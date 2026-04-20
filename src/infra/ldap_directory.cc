@@ -439,14 +439,13 @@ core::Result<bool> LdapDirectory::IsUserInGroup(const std::string& uid,
     }
 
     LDAPMessage* entry = ldap_first_entry(ld.get(), res.get());
-    if (entry == nullptr) {
-      return core::Result<bool>::Ok(false);
+    if (entry != nullptr) {
+      std::optional<std::string> dn = GetEntryDn(ld.get(), entry);
+      if (dn.has_value() && !dn->empty()) user_dn = std::move(*dn);
     }
-    std::optional<std::string> dn = GetEntryDn(ld.get(), entry);
-    if (!dn.has_value() || dn->empty()) {
-      return core::Result<bool>::Ok(false);
-    }
-    user_dn = std::move(*dn);
+    // user_dn may remain empty if the principal has no LDAP posixAccount entry
+    // (e.g. Kerberos-only principals).  The group-check below handles both cases:
+    // exact DN match when user_dn is set, uid-RDN fallback otherwise.
   }
 
   // Step 2: Fetch the group entry and check membership.
@@ -491,13 +490,19 @@ core::Result<bool> LdapDirectory::IsUserInGroup(const std::string& uid,
     }
 
     // member and uniqueMember store full DNs.
+    // Primary check: exact DN match (user_dn found via LDAP lookup).
+    // Fallback: uid= RDN prefix match — handles Kerberos-only principals that
+    // are referenced by a full DN in the group but have no posixAccount entry.
+    const std::string uid_rdn_prefix = "uid=" + uid + ",";
     for (const char* attr : {"member", "uniqueMember"}) {
       BervalValuesHandle vals(
           ldap_get_values_len(ld.get(), entry, const_cast<char*>(attr)));
       if (vals) {
         for (int i = 0; vals[i] != nullptr; ++i) {
           std::string val(vals[i]->bv_val, vals[i]->bv_len);
-          if (val == user_dn) {
+          if ((!user_dn.empty() && val == user_dn) ||
+              (user_dn.empty() && val.size() > uid_rdn_prefix.size() &&
+               val.substr(0, uid_rdn_prefix.size()) == uid_rdn_prefix)) {
             return core::Result<bool>::Ok(true);
           }
         }
