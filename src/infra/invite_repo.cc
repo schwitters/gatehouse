@@ -171,6 +171,23 @@ core::Result<void> InviteRepo::UpdateStatus(const std::string& invite_id, Invite
   return core::Result<void>::Ok();
 }
 
+core::Result<void> InviteRepo::UpdateEmail(const std::string& invite_id, const std::string& email) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) {
+    return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+  }
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql = "UPDATE invite SET invited_email=? WHERE invite_id=?;";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<void>::Err(StmtErr(rc, dbh, "prepare(update_email)"));
+  (void)sqlite3_bind_text(stmt, 1, email.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_text(stmt, 2, invite_id.c_str(), -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(rc, dbh, "step(update_email)"));
+  return core::Result<void>::Ok();
+}
+
 core::Result<void> InviteRepo::Revoke(const std::string& invite_id, std::int64_t now) {
   sqlite3* dbh = db_.handle();
   if (dbh == nullptr) {

@@ -50,6 +50,9 @@ class InviteRepo final {
   [[nodiscard]] core::Result<void> UpdateStatus(const std::string& invite_id, InviteStatus st,
                                                 std::int64_t now);
 
+  [[nodiscard]] core::Result<void> UpdateEmail(const std::string& invite_id,
+                                               const std::string& email);
+
   [[nodiscard]] core::Result<void> Revoke(const std::string& invite_id, std::int64_t now);
 
   // Revoke all non-completed, non-revoked invites for tenant+uid (used before re-invite).

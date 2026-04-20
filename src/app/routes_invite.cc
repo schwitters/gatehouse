@@ -343,6 +343,25 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
     const auto& row = *inv.value();
 
+    // Refresh email from LDAP in case it changed since the invite was created.
+    std::string send_to_email = row.invited_email;
+    if (!row.invited_uid.empty()) {
+      std::optional<std::string> fresh_mail;
+      if (ctx.ldap_dir.has_value()) {
+        auto lr = ctx.ldap_dir->LookupMail(row.tenant_id, row.invited_uid);
+        if (lr.ok() && lr.value().has_value()) fresh_mail = lr.value();
+      } else if (!ctx.cfg.ldif_path.empty()) {
+        fresh_mail = ctx.ldif_dir.LookupMail(row.tenant_id, row.invited_uid);
+      }
+      if (fresh_mail.has_value() && !fresh_mail->empty() && *fresh_mail != row.invited_email) {
+        std::fprintf(stderr, "[gatehouse][invite] email updated for %s/%s: %s -> %s\n",
+                     row.tenant_id.c_str(), row.invited_uid.c_str(),
+                     row.invited_email.c_str(), fresh_mail->c_str());
+        (void)ctx.invites.UpdateEmail(row.invite_id, *fresh_mail);
+        send_to_email = *fresh_mail;
+      }
+    }
+
     // HIGH-03: Rejection-sampling to eliminate modular bias in the OTP.
     constexpr unsigned int kRange = 900000U;
     constexpr unsigned int kLimit = ((~0U) - (~0U) % kRange);
@@ -384,7 +403,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
         "Your " + ctx.cfg.instance_title + " verification code is:\n\n" + otp + "\n\n"
         "It expires in 10 minutes.\n";
 
-    auto mail_rc = ctx.email.SendText(row.invited_email, subject, body_txt);
+    auto mail_rc = ctx.email.SendText(send_to_email, subject, body_txt);
     if (!mail_rc.ok()) return HtmlPage(502, "<h1>Mail send failed</h1>");
 
     (void)ctx.invites.UpdateStatus(row.invite_id, infra::InviteStatus::kStepupSent, now);
