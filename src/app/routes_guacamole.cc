@@ -355,54 +355,25 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     // Embed guac_data and guac_base_url as JS string literals.
     // JsonStr() escapes backslash and double-quote so they are safe inside "...".
-    const std::string js_data     = JsonStr(t.value().guac_data);
-    const std::string js_base     = JsonStr(t.value().guac_base_url);
-    const std::string js_uid      = JsonStr(t.value().uid);
+    const std::string js_data = JsonStr(t.value().guac_data);
+    const std::string js_base = JsonStr(t.value().guac_base_url);
 
     std::string body;
-    body.reserve(2048);
+    body.reserve(1024);
     body += "<!DOCTYPE html><html><head><meta charset=\"utf-8\">";
     body += "<title>Connecting\xe2\x80\xa6</title>";
     body += "<style>body{margin:0;display:flex;align-items:center;justify-content:center;";
     body += "height:100vh;background:#1a1a2e;font-family:sans-serif;color:#ccc;}</style>";
-    body += "</head><body><p id=msg>Connecting\xe2\x80\xa6</p><script>";
-    body += "(async function(){";
+    body += "</head><body><p>Connecting\xe2\x80\xa6</p><script>";
+    // Clear any stale GUAC_AUTH inherited from the opener tab so Guacamole always
+    // processes the ?data= parameter fresh and redirects to the correct connection.
+    body += "(function(){";
     body += "var base=\"" + js_base + "\";";
-    body += "var encData=\"" + js_data + "\";";
-    body += "var uid=\"" + js_uid + "\";";
-    body += "var msg=document.getElementById('msg');";
-    body += "try{";
-    // Step 1: exchange encrypted JSON for Guacamole authToken
-    body += "var tr=await fetch(base+\"/api/tokens\",{";
-    body += "method:\"POST\",";
-    body += "headers:{\"Content-Type\":\"application/x-www-form-urlencoded\"},";
-    body += "body:\"data=\"+encodeURIComponent(encData)});";
-    body += "if(!tr.ok)throw new Error(\"Token exchange failed: \"+tr.status);";
-    body += "var tj=await tr.json();";
-    body += "var authToken=tj.authToken,dataSource=tj.dataSource,username=tj.username||uid;";
-    // Step 2: list connections to find connection ID for direct navigation
-    body += "var cr=await fetch(";
-    body += "base+\"/api/session/data/\"+encodeURIComponent(dataSource)+\"/connections\",";
-    body += "{headers:{\"Guacamole-Token\":authToken}});";
-    body += "if(!cr.ok)throw new Error(\"Connection list failed: \"+cr.status);";
-    body += "var conns=await cr.json();";
-    body += "var ids=Object.keys(conns);";
-    body += "if(!ids.length)throw new Error(\"No connections returned\");";
-    body += "var connId=ids[0];";
-    // Guacamole client identifier: standard Base64 of "<id>\x00c\x00<dataSource>".
-    // Must NOT be encodeURIComponent'd — Guacamole's Angular router reads the hash
-    // fragment raw; percent-encoding '+' as '%2B' would break the Base64 decode.
-    body += "var clientId=btoa(connId+\"\\x00c\\x00\"+dataSource);";
-    // Step 3: explicitly overwrite GUAC_AUTH — fixes stale sessionStorage from previous sessions
-    body += "sessionStorage.setItem(\"GUAC_AUTH\",JSON.stringify({";
-    body += "authToken:authToken,dataSource:dataSource,username:username,";
-    body += "availableDataSources:[dataSource]}));";
-    // Step 4: navigate directly to the connection — clientId is standard Base64, no encoding
-    body += "window.location.replace(base+\"/#/client/\"+clientId);";
-    body += "}catch(e){";
-    body += "msg.style.color=\"#f66\";";
-    body += "msg.textContent=\"Connection failed: \"+e.message;";
-    body += "}}());";
+    body += "var enc=\"" + js_data + "\";";
+    body += "try{localStorage.removeItem(\"GUAC_AUTH_TOKEN\");}catch(e){}";
+    body += "try{sessionStorage.removeItem(\"GUAC_AUTH\");}catch(e){}";
+    body += "window.location.replace(base+\"/#/?data=\"+encodeURIComponent(enc));";
+    body += "})();";
     body += "</script></body></html>";
 
     crow::response r(200);
@@ -486,9 +457,6 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       crow::json::wvalue v; v["ok"] = false; v["error"] = "ticket decrypt failed";
       return Json(500, v);
     }
-
-    // Delete ticket (one-time use)
-    (void)ctx.vault.Delete(ticket_id);
 
     const std::string ccache_b64 = core::Base64Encode(ccache.value());
 

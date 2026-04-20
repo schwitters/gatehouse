@@ -44,7 +44,10 @@ core::Result<void> CredFetchTokenRepo::Insert(const CredFetchTokenRow& row) {
   (void)sqlite3_bind_int64(stmt, 6, row.issued_at);
   (void)sqlite3_bind_int64(stmt, 7, row.expires_at);
   (void)sqlite3_bind_null(stmt, 8);
-  (void)sqlite3_bind_text(stmt, 9, row.ticket_id.c_str(), -1, SQLITE_TRANSIENT);
+  if (row.ticket_id.empty())
+    (void)sqlite3_bind_null(stmt, 9);
+  else
+    (void)sqlite3_bind_text(stmt, 9, row.ticket_id.c_str(), -1, SQLITE_TRANSIENT);
 
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);

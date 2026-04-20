@@ -62,6 +62,8 @@ struct HttpServerConfig {
   std::string guacamole_secret;
   std::int64_t guac_token_ttl_seconds{60};
   std::string guac_connection_template_path;
+  // Protocols for which Connect buttons are shown. Empty = all (rdp + ssh).
+  std::vector<std::string> guac_enabled_protocols;
 
   // URL path prefix for hosting under a sub-path (e.g. "/gatehouse").
   // Must start with '/' or be empty. Must not end with '/'.

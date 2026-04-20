@@ -75,25 +75,44 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     // JavaScript to fetch and render hosts
     // MED-08: Use DOM APIs with textContent to avoid innerHTML XSS from LDAP data.
+    // Build _GUAC_PROTOS: list of protocols for which Connect buttons are shown.
+    // Empty guac_enabled_protocols in config means "all" → ['rdp','ssh'].
+    const bool guac_on = !ctx.cfg.guacamole_url.empty() && !ctx.cfg.guacamole_secret.empty();
+    std::string guac_protos_js;
+    if (!guac_on) {
+      guac_protos_js = "[]";
+    } else if (ctx.cfg.guac_enabled_protocols.empty()) {
+      guac_protos_js = "['rdp','ssh']";
+    } else {
+      guac_protos_js = "[";
+      for (const auto& p : ctx.cfg.guac_enabled_protocols)
+        guac_protos_js += "'" + p + "',";
+      guac_protos_js.back() = ']';
+    }
+
     html += "<script>";
     html += "const _B='" + B + "';";
+    html += "const _GUAC_PROTOS=" + guac_protos_js + ";";
     html += "function getCsrfToken(){var m=document.cookie.match(/(^|;)\\s*gh_csrf=([^;]+)/);return m?decodeURIComponent(m[2]):''}";
-    html += "async function connectHost(hostname,protocol){";
+    // Each Connect click generates a fresh encrypted JSON token via the API.
+    // The btn parameter is disabled during the request to prevent double-clicks.
+    html += "async function connectHost(hostname,protocol,btn){";
+    html += "  var lbl=(protocol==='rdp')?'Connect (RDP)':'Connect (SSH)';";
+    html += "  if(btn){btn.disabled=true;btn.textContent='Connecting\u2026';}";
     // Open blank tab immediately on user click — before any async work —
     // so popup blockers see a direct user-gesture origin.
     html += "  var w=window.open('','_blank');";
-    html += "  if(!w){alert('Popup blocked. Please allow popups for this page.');return;}";
+    html += "  if(!w){if(btn){btn.disabled=false;btn.textContent=lbl;}alert('Popup blocked. Please allow popups for this page.');return;}";
     html += "  const r=await fetch(_B+'/api/me/guacamole-session',{method:'POST',";
     html += "    headers:{'Content-Type':'application/json','X-CSRF-Token':getCsrfToken()},";
     html += "    body:JSON.stringify({hostname:hostname,protocol:protocol})});";
     html += "  const j=await r.json();";
-    html += "  if(!r.ok||!j.ok){w.close();alert('Connect failed: '+(j.error||r.status));return;}";
+    html += "  if(!r.ok||!j.ok){w.close();if(btn){btn.disabled=false;btn.textContent=lbl;}alert('Connect failed: '+(j.error||r.status));return;}";
     // Navigate the already-open blank tab to the relay page.
-    // The relay page exchanges the encrypted JSON for a fresh Guacamole authToken,
-    // explicitly sets sessionStorage.GUAC_AUTH, then navigates to the connection.
-    // This avoids the stale-sessionStorage bug where repeated connects in the same
-    // browser required opening a new browser window entirely.
+    // The relay page clears stale GUAC_AUTH_TOKEN then redirects to /#/?data=...
+    // so Guacamole always processes the fresh encrypted JSON.
     html += "  w.location.replace(j.launch_url);";
+    html += "  if(btn){setTimeout(function(){btn.disabled=false;btn.textContent=lbl;},4000);}";
     html += "}";
     html += "async function loadHosts() {";
     html += "  const r = await fetch(_B+'/api/me/hosts');";
@@ -114,13 +133,15 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "    code.textContent = host.ip || 'No IP configured';";
     html += "    p.appendChild(code);";
     html += "    const proto=(host.protocol==='rdp')?'rdp':'ssh';";
-    html += "    const btn=document.createElement('button');";
-    html += "    btn.textContent=(proto==='rdp')?'Connect (RDP)':'Connect (SSH)';";
-    html += "    btn.style.cssText='margin-top:10px;padding:6px 12px;font-size:0.85em;width:100%;background:#1a6b38';";
-    html += "    btn.onclick=(function(hn,pr){return function(){connectHost(hn,pr);};})(host.hostname||'',proto);";
     html += "    card.appendChild(b);";
     html += "    card.appendChild(p);";
-    html += "    card.appendChild(btn);";
+    html += "    if(_GUAC_PROTOS.indexOf(proto)!==-1){";
+    html += "      const btn=document.createElement('button');";
+    html += "      btn.textContent=(proto==='rdp')?'Connect (RDP)':'Connect (SSH)';";
+    html += "      btn.style.cssText='margin-top:10px;padding:6px 12px;font-size:0.85em;width:100%;background:#1a6b38';";
+    html += "      btn.onclick=function(e){connectHost(host.hostname||'',proto,e.currentTarget);};";
+    html += "      card.appendChild(btn);";
+    html += "    }";
     html += "    grid.appendChild(card);";
     html += "  }";
     html += "  div.innerHTML = '';";

@@ -52,6 +52,7 @@ void PrintUsage(const char* argv0) {
       << "  --guac-token-ttl SECS        Credential-fetch token lifetime (default: 60)\n"
       << "  --guac-connection-template P Path to Guacamole connection JSON template\n"
       << "                               (default: built-in; see config/guac_connection_template.json)\n"
+      << "  --guac-protocols CSV         Protocols for Connect buttons: rdp, ssh (default: all)\n"
       << "\n"
       << "Security:\n"
       << "  --secure-cookies       Set Secure flag on session cookies (use with HTTPS/reverse proxy)\n"
@@ -171,6 +172,9 @@ int main(int argc, char** argv) {
       if (!ParseI64(argv[++i], &ttl) || ttl <= 0) { std::cerr << "Invalid --guac-token-ttl\n"; return 2; }
       cfg.guac_token_ttl_seconds = ttl; continue;
     }
+    if (arg == "--guac-protocols" && i + 1 < argc) {
+      cfg.guac_enabled_protocols = SplitCsv(argv[++i]); continue;
+    }
 
     // LDIF fallback
     if (arg == "--ldif" && i + 1 < argc) { cfg.ldif_path = argv[++i]; continue; }
@@ -192,6 +196,7 @@ int main(int argc, char** argv) {
     gatehouse::infra::MigrateConfig mcfg;
     mcfg.schema_v1_path = "db/schema_v1.sql";
     mcfg.schema_v2_path = "db/schema_v2.sql";
+    mcfg.schema_v6_path = "db/schema_v6.sql";
     auto rc = gatehouse::infra::Migrate(*db, mcfg);
     if (!rc.ok()) { std::cerr << "DB migrate failed: " << rc.status().ToString() << "\n"; return 1; }
   }
