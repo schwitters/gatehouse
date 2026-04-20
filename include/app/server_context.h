@@ -29,6 +29,27 @@ namespace gatehouse::app {
 // Cookie name for the invite-flow session (shared across route files).
 constexpr const char* kInviteCookie = "gh_inv_sid";
 
+// Short-lived tickets for the Guacamole relay launch page.
+// Keyed by a random hex UUID; consumed once; TTL 30 s.
+struct GuacLaunchTicket {
+  std::string guac_data;     // Base64-encoded Guacamole Encrypted JSON payload
+  std::string guac_base_url; // e.g. "https://lab.example.com/guacamole"
+  std::string uid;
+  std::int64_t expires_at{0};
+};
+
+struct GuacLaunchStore {
+  static constexpr std::int64_t kTtlSeconds = 30;
+  static constexpr std::size_t  kMaxEntries = 500;
+
+  std::mutex mu;
+  std::unordered_map<std::string, GuacLaunchTicket> tickets;
+
+  void Put(const std::string& id, GuacLaunchTicket t);
+  // Returns Err if the ticket is unknown or expired (always consumed on success).
+  [[nodiscard]] core::Result<GuacLaunchTicket> Consume(const std::string& id, std::int64_t now);
+};
+
 // Per-IP login rate limiter.  Max 10 attempts per 5-minute window.
 // MED-07: Hard cap on map size to prevent memory exhaustion from IP spoofing.
 struct LoginRateLimiter {
@@ -63,6 +84,7 @@ struct ServerContext {
   IEmailSender& email;
   const std::vector<std::uint8_t>& master_key;
   LoginRateLimiter& rate_limiter;
+  GuacLaunchStore&  guac_launch;
 };
 
 // ---- Auth / session helpers ----

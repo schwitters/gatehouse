@@ -79,13 +79,21 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "const _B='" + B + "';";
     html += "function getCsrfToken(){var m=document.cookie.match(/(^|;)\\s*gh_csrf=([^;]+)/);return m?decodeURIComponent(m[2]):''}";
     html += "async function connectHost(hostname,protocol){";
+    // Open blank tab immediately on user click — before any async work —
+    // so popup blockers see a direct user-gesture origin.
+    html += "  var w=window.open('','_blank');";
+    html += "  if(!w){alert('Popup blocked. Please allow popups for this page.');return;}";
     html += "  const r=await fetch(_B+'/api/me/guacamole-session',{method:'POST',";
     html += "    headers:{'Content-Type':'application/json','X-CSRF-Token':getCsrfToken()},";
     html += "    body:JSON.stringify({hostname:hostname,protocol:protocol})});";
     html += "  const j=await r.json();";
-    html += "  if(!r.ok||!j.ok){alert('Connect failed: '+(j.error||r.status));return;}";
-    html += "  try{localStorage.removeItem('GUAC_AUTH');}catch(e){}";
-    html += "  window.open(j.url,'_blank');";
+    html += "  if(!r.ok||!j.ok){w.close();alert('Connect failed: '+(j.error||r.status));return;}";
+    // Navigate the already-open blank tab to the relay page.
+    // The relay page exchanges the encrypted JSON for a fresh Guacamole authToken,
+    // explicitly sets sessionStorage.GUAC_AUTH, then navigates to the connection.
+    // This avoids the stale-sessionStorage bug where repeated connects in the same
+    // browser required opening a new browser window entirely.
+    html += "  w.location.replace(j.launch_url);";
     html += "}";
     html += "async function loadHosts() {";
     html += "  const r = await fetch(_B+'/api/me/hosts');";

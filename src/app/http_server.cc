@@ -101,6 +101,7 @@ core::Result<void> HttpServer::Run() {
     infra::TicketVaultReadRepo ticket_vault_read(*db_);
 
     LoginRateLimiter rate_limiter;
+    GuacLaunchStore  guac_launch;
 
     ServerContext ctx{
         cfg_,
@@ -119,6 +120,7 @@ core::Result<void> HttpServer::Run() {
         *email,
         master_key,
         rate_limiter,
+        guac_launch,
     };
 
     RegisterMiscRoutes(app, ctx);

@@ -15,6 +15,37 @@
 
 namespace gatehouse::app {
 
+// ---- GuacLaunchStore ----
+
+void GuacLaunchStore::Put(const std::string& id, GuacLaunchTicket t) {
+  std::lock_guard<std::mutex> lk(mu);
+  if (tickets.size() >= kMaxEntries) {
+    const std::int64_t now = core::UnixNow();
+    for (auto it = tickets.begin(); it != tickets.end(); ) {
+      if (it->second.expires_at <= now) it = tickets.erase(it);
+      else ++it;
+    }
+  }
+  tickets[id] = std::move(t);
+}
+
+core::Result<GuacLaunchTicket> GuacLaunchStore::Consume(
+    const std::string& id, std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = tickets.find(id);
+  if (it == tickets.end())
+    return core::Result<GuacLaunchTicket>::Err(
+        core::Status::Error(core::StatusCode::kNotFound, "launch ticket not found"));
+  if (it->second.expires_at <= now) {
+    tickets.erase(it);
+    return core::Result<GuacLaunchTicket>::Err(
+        core::Status::Error(core::StatusCode::kNotFound, "launch ticket expired"));
+  }
+  GuacLaunchTicket t = std::move(it->second);
+  tickets.erase(it);
+  return core::Result<GuacLaunchTicket>::Ok(std::move(t));
+}
+
 // ---- LoginRateLimiter ----
 
 bool LoginRateLimiter::Check(const std::string& ip) {

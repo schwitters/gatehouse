@@ -119,10 +119,9 @@ std::string SubstitutePlaceholders(
   return tmpl;
 }
 
-// Builds the Guacamole Encrypted JSON payload and returns the full redirect URL.
-// protocol must be "rdp" or "ssh".
-core::Result<std::string> BuildGuacUrl(
-    const std::string& guacamole_url,
+// Encrypts the Guacamole connection JSON and returns the Base64 payload ("data").
+// This is the value posted to Guacamole's /api/tokens as the "data" field.
+core::Result<std::string> BuildGuacData(
     const std::string& guacamole_secret,
     const std::string& uid,
     const std::string& hostname,
@@ -140,22 +139,19 @@ core::Result<std::string> BuildGuacUrl(
       connection_template, uid, token_hex, hostname, effective_host,
       protocol, port, expires_ms);
 
-
-
   std::fprintf(stderr, "[gatehouse][guac] plaintext JSON for uid=%s host=%s: %s\n",
                uid.c_str(), hostname.c_str(), json.c_str());
 
   const std::vector<std::uint8_t> plaintext(json.begin(), json.end());
 
   // Guacamole encrypted JSON format (matches Java UserDataService):
-  //   1. full_key = HexDecode(secret)        — key length determines AES variant
+  //   1. full_key = HexDecode(secret)
   //   2. HMAC = HmacSHA256(full_key, json)   — 32-byte signature
   //   3. signed_payload = HMAC || json
-  //   4. encrypt = AesCBC(full_key, random_IV, signed_payload)
-  //   5. output = Base64(random_IV[16] || ciphertext)
+  //   4. encrypt = AesCBC(full_key, NULL_IV, signed_payload)
+  //   5. output = Base64(ciphertext)
   const std::vector<std::uint8_t> full_key = DecodeGuacSecret(guacamole_secret);
 
-  // Log key for diagnostics.
   {
     std::string k;
     for (std::uint8_t b : full_key) { char buf[3]; std::snprintf(buf,3,"%02x",b); k+=buf; }
@@ -163,19 +159,14 @@ core::Result<std::string> BuildGuacUrl(
                  guacamole_secret.size(), full_key.size(), k.c_str());
   }
 
-  // Step 1: HMAC-SHA256 of JSON bytes, keyed with the full decoded key.
   auto hmac = core::HmacSha256(full_key, plaintext);
   if (!hmac.ok()) return core::Result<std::string>::Err(hmac.status());
 
-  // Step 2: signed_payload = HMAC(32 bytes) || json.
   std::vector<std::uint8_t> signed_payload;
   signed_payload.reserve(32 + plaintext.size());
   signed_payload.insert(signed_payload.end(), hmac.value().begin(), hmac.value().end());
   signed_payload.insert(signed_payload.end(), plaintext.begin(), plaintext.end());
 
-  // Step 3: AES-CBC with null IV, key-size-agnostic (32 bytes → AES-256).
-  // Java's CryptoService.decrypt() uses a hardcoded NULL_IV; the ciphertext
-  // is the entire base64-decoded payload — no IV prepended.
   const std::vector<std::uint8_t> null_iv(16, 0);
   auto enc = core::AesCbcEncryptWithIv(full_key, null_iv, signed_payload);
   if (!enc.ok()) return core::Result<std::string>::Err(enc.status());
@@ -184,18 +175,12 @@ core::Result<std::string> BuildGuacUrl(
                signed_payload.size(), enc.value().size());
 
   const std::string data = core::Base64Encode(enc.value());
-
   std::fprintf(stderr, "[gatehouse][guac] base64 payload for uid=%s host=%s: %s\n",
                uid.c_str(), hostname.c_str(), data.c_str());
 
-  // Percent-encode the data parameter: standard Base64 contains '+' which URL
-  // parsers decode as space, corrupting the payload before Guacamole sees it.
-  std::string url = guacamole_url;
-  if (!url.empty() && url.back() == '/') url.pop_back();
-  url += "/#/?data=" + UrlEncodeParam(data);
-
-  return core::Result<std::string>::Ok(std::move(url));
+  return core::Result<std::string>::Ok(std::move(data));
 }
+
 
 }  // namespace
 
@@ -211,7 +196,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // Request body (JSON): {"hostname": "...", "protocol": "rdp"|"ssh"}
   // Response (JSON):     {"ok": true, "url": "..."}
   app.route_dynamic(B + "/api/me/guacamole-session")
-      .methods("POST"_method)([&ctx, connection_template](const crow::request& req) {
+      .methods("POST"_method)([&ctx, &B, connection_template](const crow::request& req) {
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"] = false; v["error"] = "unauthenticated";
@@ -309,19 +294,122 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       return Json(500, v);
     }
 
-    auto url_res = BuildGuacUrl(
-        ctx.cfg.guacamole_url, ctx.cfg.guacamole_secret,
+    // Build encrypted JSON payload.
+    auto data_res = BuildGuacData(
+        ctx.cfg.guacamole_secret,
         s->uid, hostname, host_ip, protocol, token_hex, expires,
         connection_template);
-    if (!url_res.ok()) {
-      crow::json::wvalue v; v["ok"] = false; v["error"] = url_res.status().ToString();
+    if (!data_res.ok()) {
+      crow::json::wvalue v; v["ok"] = false; v["error"] = data_res.status().ToString();
       return Json(500, v);
     }
 
+    // Create a short-lived launch ticket so the relay page can retrieve the
+    // encrypted payload without embedding it in a URL query string.
+    auto lt_id_bytes = core::RandomBytes(16);
+    if (!lt_id_bytes.ok()) {
+      crow::json::wvalue v; v["ok"] = false; v["error"] = "random generation failed";
+      return Json(500, v);
+    }
+    const std::string lt_id = core::HexEncode(lt_id_bytes.value());
+
+    std::string guac_base = ctx.cfg.guacamole_url;
+    if (!guac_base.empty() && guac_base.back() == '/') guac_base.pop_back();
+
+    GuacLaunchTicket lt;
+    lt.guac_data     = data_res.value();
+    lt.guac_base_url = guac_base;
+    lt.uid           = s->uid;
+    lt.expires_at    = now + GuacLaunchStore::kTtlSeconds;
+    ctx.guac_launch.Put(lt_id, std::move(lt));
+
+    // Also build the legacy ?data= URL for clients that still use it.
+    std::string legacy_url = guac_base + "/#/?data=" + UrlEncodeParam(data_res.value());
+
     crow::json::wvalue v;
-    v["ok"] = true;
-    v["url"] = url_res.value();
+    v["ok"]          = true;
+    v["url"]         = legacy_url;
+    v["launch_url"]  = B + "/guac-launch?t=" + lt_id;
     return Json(200, v);
+  });
+
+  // ---- GET /guac-launch?t=<ticket> ----
+  // Relay page: exchanges the launch ticket for a Guacamole authToken client-side,
+  // explicitly writes sessionStorage.GUAC_AUTH, then navigates to the connection.
+  // This fixes the stale-sessionStorage problem that forces users to open a new browser.
+  app.route_dynamic(B + "/guac-launch")
+      .methods("GET"_method)([&ctx](const crow::request& req) {
+    const std::string ticket_id = req.url_params.get("t")
+        ? std::string(req.url_params.get("t")) : "";
+    if (ticket_id.empty()) {
+      crow::response r(400); r.body = "missing ticket"; return r;
+    }
+
+    const std::int64_t now = core::UnixNow();
+    auto t = ctx.guac_launch.Consume(ticket_id, now);
+    if (!t.ok()) {
+      crow::response r(410);
+      r.body = "Launch ticket expired or invalid. Please click Connect again.";
+      return r;
+    }
+
+    // Embed guac_data and guac_base_url as JS string literals.
+    // JsonStr() escapes backslash and double-quote so they are safe inside "...".
+    const std::string js_data     = JsonStr(t.value().guac_data);
+    const std::string js_base     = JsonStr(t.value().guac_base_url);
+    const std::string js_uid      = JsonStr(t.value().uid);
+
+    std::string body;
+    body.reserve(2048);
+    body += "<!DOCTYPE html><html><head><meta charset=\"utf-8\">";
+    body += "<title>Connecting\xe2\x80\xa6</title>";
+    body += "<style>body{margin:0;display:flex;align-items:center;justify-content:center;";
+    body += "height:100vh;background:#1a1a2e;font-family:sans-serif;color:#ccc;}</style>";
+    body += "</head><body><p id=msg>Connecting\xe2\x80\xa6</p><script>";
+    body += "(async function(){";
+    body += "var base=\"" + js_base + "\";";
+    body += "var encData=\"" + js_data + "\";";
+    body += "var uid=\"" + js_uid + "\";";
+    body += "var msg=document.getElementById('msg');";
+    body += "try{";
+    // Step 1: exchange encrypted JSON for Guacamole authToken
+    body += "var tr=await fetch(base+\"/api/tokens\",{";
+    body += "method:\"POST\",";
+    body += "headers:{\"Content-Type\":\"application/x-www-form-urlencoded\"},";
+    body += "body:\"data=\"+encodeURIComponent(encData)});";
+    body += "if(!tr.ok)throw new Error(\"Token exchange failed: \"+tr.status);";
+    body += "var tj=await tr.json();";
+    body += "var authToken=tj.authToken,dataSource=tj.dataSource,username=tj.username||uid;";
+    // Step 2: list connections to find connection ID for direct navigation
+    body += "var cr=await fetch(";
+    body += "base+\"/api/session/data/\"+encodeURIComponent(dataSource)+\"/connections\",";
+    body += "{headers:{\"Guacamole-Token\":authToken}});";
+    body += "if(!cr.ok)throw new Error(\"Connection list failed: \"+cr.status);";
+    body += "var conns=await cr.json();";
+    body += "var ids=Object.keys(conns);";
+    body += "if(!ids.length)throw new Error(\"No connections returned\");";
+    body += "var connId=ids[0];";
+    // Guacamole client identifier: standard Base64 of "<id>\x00c\x00<dataSource>".
+    // Must NOT be encodeURIComponent'd — Guacamole's Angular router reads the hash
+    // fragment raw; percent-encoding '+' as '%2B' would break the Base64 decode.
+    body += "var clientId=btoa(connId+\"\\x00c\\x00\"+dataSource);";
+    // Step 3: explicitly overwrite GUAC_AUTH — fixes stale sessionStorage from previous sessions
+    body += "sessionStorage.setItem(\"GUAC_AUTH\",JSON.stringify({";
+    body += "authToken:authToken,dataSource:dataSource,username:username,";
+    body += "availableDataSources:[dataSource]}));";
+    // Step 4: navigate directly to the connection — clientId is standard Base64, no encoding
+    body += "window.location.replace(base+\"/#/client/\"+clientId);";
+    body += "}catch(e){";
+    body += "msg.style.color=\"#f66\";";
+    body += "msg.textContent=\"Connection failed: \"+e.message;";
+    body += "}}());";
+    body += "</script></body></html>";
+
+    crow::response r(200);
+    r.set_header("Content-Type", "text/html; charset=utf-8");
+    r.set_header("Cache-Control", "no-store");
+    r.body = std::move(body);
+    return r;
   });
 
   // ---- GET /api/cred-fetch/ticket ----
