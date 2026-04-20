@@ -431,6 +431,42 @@ async function sendInvite(tenantId, uid, btnEl) {
   await loadUsers();
 }
 
+async function resetKrb(tenantId, uid, btnEl) {
+  if (!confirm('Kerberos-Attribute für "' + uid + '" löschen?')) return;
+  btnEl.disabled = true;
+  const orig = btnEl.textContent;
+  btnEl.textContent = '...';
+  const r = await fetch(_B+'/api/admin/user/reset-krb', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
+    body: JSON.stringify({tenant_id: tenantId, uid})
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) alert('Fehler: ' + (j && j.error ? j.error : r.status));
+  btnEl.disabled = false;
+  btnEl.textContent = orig;
+}
+
+async function resetInvite(tenantId, uid, btnEl) {
+  if (!confirm('Alle Einladungen für "' + uid + '" zurücksetzen, E-Mail aktualisieren und neu einladen?')) return;
+  btnEl.disabled = true;
+  const orig = btnEl.textContent;
+  btnEl.textContent = '...';
+  const r = await fetch(_B+'/api/admin/user/reset-invite', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
+    body: JSON.stringify({tenant_id: tenantId, uid})
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    alert('Fehler: ' + (j && j.error ? j.error : r.status));
+    btnEl.disabled = false;
+    btnEl.textContent = orig;
+    return;
+  }
+  await loadUsers();
+}
+
 async function loadUsers() {
   const t = document.getElementById('tenantSel').value;
   if (!t) { document.getElementById('status').textContent = 'Please select a tenant.'; return; }
@@ -496,15 +532,27 @@ async function loadUsers() {
       '<td></td>';
 
     const td = tr.querySelectorAll('td')[6];
+    td.style.cssText = 'white-space:nowrap';
     const isActive = st === 0 || st === 1 || st === 2 || st === 3;
     const isCompleted = st === 4;
+    const btnStyle = 'padding:4px 8px;font-size:12px;border:none;border-radius:4px;cursor:pointer;margin:2px;';
     if (!isCompleted) {
       const btn = document.createElement('button');
       btn.textContent = isActive ? 'Resend' : 'Send Invite';
-      btn.style.cssText = 'padding:5px 10px;font-size:13px;';
+      btn.style.cssText = btnStyle;
       btn.onclick = () => sendInvite(t, u.uid, btn);
       td.appendChild(btn);
     }
+    const krbBtn = document.createElement('button');
+    krbBtn.textContent = 'Kerberos Reset';
+    krbBtn.style.cssText = btnStyle + 'background:#fd7e14;color:#fff;';
+    krbBtn.onclick = () => resetKrb(t, u.uid, krbBtn);
+    td.appendChild(krbBtn);
+    const riBtn = document.createElement('button');
+    riBtn.textContent = 'Reset Invitation';
+    riBtn.style.cssText = btnStyle + 'background:#0b57d0;color:#fff;';
+    riBtn.onclick = () => resetInvite(t, u.uid, riBtn);
+    td.appendChild(riBtn);
 
     tbody.appendChild(tr);
   }
@@ -800,6 +848,105 @@ loadTenants();
     }
 
     crow::json::wvalue v; v["ok"]=true; return Json(200, v);
+  });
+
+  // ---- API: Reset invitation (revoke all + delete krb attrs + new invite) ----
+  app.route_dynamic(B + "/api/admin/user/reset-invite").methods("POST"_method)([&ctx](const crow::request& req) {
+    auto s = RequireAuth(ctx, req);
+    if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
+    if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
+    if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
+
+    auto body = crow::json::load(req.body);
+    if (!body || !body.has("tenant_id") || !body.has("uid")) {
+      crow::json::wvalue v; v["ok"]=false; v["error"]="invalid json (need tenant_id, uid)"; return Json(400, v);
+    }
+    const std::string tenant_id = std::string(body["tenant_id"].s());
+    const std::string uid       = std::string(body["uid"].s());
+    if (tenant_id.empty() || uid.empty()) {
+      crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id/uid empty"; return Json(400, v);
+    }
+    auto safe_name = [](const std::string& n) -> bool {
+      if (n.empty() || n.size() > 64) return false;
+      for (char c : n) if (!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.')) return false;
+      return true;
+    };
+    if (!safe_name(uid) || !safe_name(tenant_id)) {
+      crow::json::wvalue v; v["ok"]=false; v["error"]="invalid characters in tenant_id or uid"; return Json(400, v);
+    }
+
+    const std::int64_t now = core::UnixNow();
+
+    // 1. Revoke all invites (including completed).
+    (void)ctx.invites.RevokeAll(tenant_id, uid, now);
+
+    // 2. Delete Kerberos attributes so the principal can be recreated.
+    if (ctx.ldap_dir.has_value()) {
+      auto krc = ctx.ldap_dir->DeleteKrbAttributes(tenant_id, uid);
+      if (!krc.ok()) {
+        std::fprintf(stderr, "[gatehouse][reset-invite] DeleteKrbAttributes failed for %s/%s: %s\n",
+                     tenant_id.c_str(), uid.c_str(), krc.status().ToString().c_str());
+      }
+    }
+
+    // 3. Look up current email from LDAP.
+    std::optional<std::string> mail;
+    if (ctx.ldap_dir.has_value()) {
+      auto rc = ctx.ldap_dir->LookupMail(tenant_id, uid);
+      if (!rc.ok()) {
+        crow::json::wvalue v; v["ok"]=false; v["error"]="directory lookup failed"; return Json(502, v);
+      }
+      mail = rc.value();
+    } else if (!ctx.cfg.ldif_path.empty()) {
+      mail = ctx.ldif_dir.LookupMail(tenant_id, uid);
+    } else {
+      crow::json::wvalue v; v["ok"]=false; v["error"]="no directory configured"; return Json(409, v);
+    }
+    if (!mail.has_value() || mail->empty()) {
+      crow::json::wvalue v; v["ok"]=false; v["error"]="user not found or missing mail"; return Json(404, v);
+    }
+
+    // 4. Create new invite and send email.
+    auto token_bytes     = core::RandomBytes(32);
+    auto invite_id_bytes = core::RandomBytes(16);
+    if (!token_bytes.ok() || !invite_id_bytes.ok()) {
+      crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v);
+    }
+    const std::string token_hex = core::HexEncode(token_bytes.value());
+    auto token_hash = core::Sha256(token_bytes.value());
+    if (!token_hash.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]="internal error"; return Json(500, v); }
+
+    infra::InviteRow row;
+    row.invite_id     = core::HexEncode(invite_id_bytes.value());
+    row.tenant_id     = tenant_id;
+    row.invited_email = *mail;
+    row.invited_uid   = uid;
+    row.token_hash    = std::move(token_hash.value());
+    row.status        = infra::InviteStatus::kInvited;
+    row.created_at    = now;
+    row.expires_at    = now + ctx.cfg.invite_ttl_seconds;
+    row.created_by    = s->uid;
+
+    auto ins = ctx.invites.Insert(row);
+    if (!ins.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]=ins.status().ToString(); return Json(500, v); }
+
+    const std::string invite_url = ctx.cfg.public_base_url + "/invite/accept?token=" + token_hex;
+    const std::string subject    = "[" + ctx.cfg.instance_title + "] You have been invited to " + tenant_id;
+    const std::string body_txt   =
+        "Hello,\n\nyou have been invited to " + ctx.cfg.instance_title + ".\n\n"
+        "Tenant: " + tenant_id + "\nUser: " + uid + "\n\n"
+        "Accept invitation:\n" + invite_url + "\n\n";
+
+    auto mail_rc = ctx.email.SendText(*mail, subject, body_txt);
+    if (!mail_rc.ok()) { crow::json::wvalue v; v["ok"]=false; v["error"]="mail send failed: " + mail_rc.status().ToString(); return Json(502, v); }
+
+    crow::json::wvalue v;
+    v["ok"]            = true;
+    v["tenant_id"]     = tenant_id;
+    v["uid"]           = uid;
+    v["invited_email"] = *mail;
+    v["expires_at"]    = row.expires_at;
+    return Json(200, v);
   });
 
   // ---- API: List tenants ----

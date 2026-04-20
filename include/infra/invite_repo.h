@@ -60,6 +60,11 @@ class InviteRepo final {
                                                  const std::string& uid,
                                                  std::int64_t now);
 
+  // Revoke ALL invites for tenant+uid including completed ones (full reset).
+  [[nodiscard]] core::Result<void> RevokeAll(const std::string& tenant_id,
+                                             const std::string& uid,
+                                             std::int64_t now);
+
   // Returns UIDs that have an active (non-expired, non-revoked) or completed invite.
   [[nodiscard]] core::Result<std::vector<std::string>> GetInvitedUids(const std::string& tenant_id,
                                                                        std::int64_t now);

@@ -302,6 +302,29 @@ core::Result<void> InviteRepo::RevokePending(const std::string& tenant_id,
 }
 
 
+core::Result<void> InviteRepo::RevokeAll(const std::string& tenant_id,
+                                         const std::string& uid,
+                                         std::int64_t now) {
+  sqlite3* dbh = db_.handle();
+  if (dbh == nullptr) return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
+
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql =
+      "UPDATE invite SET status=6, revoked_at=? "
+      "WHERE tenant_id=? AND invited_uid=? AND status != 6;";
+  int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) return core::Result<void>::Err(StmtErr(rc, dbh, "prepare(revoke_all)"));
+
+  (void)sqlite3_bind_int64(stmt, 1, now);
+  (void)sqlite3_bind_text(stmt, 2, tenant_id.c_str(), -1, SQLITE_TRANSIENT);
+  (void)sqlite3_bind_text(stmt, 3, uid.c_str(), -1, SQLITE_TRANSIENT);
+
+  rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(rc, dbh, "step(revoke_all)"));
+  return core::Result<void>::Ok();
+}
+
 core::Result<std::vector<InviteRow>> InviteRepo::GetLatestPerUid(const std::string& tenant_id) {
   sqlite3* dbh = db_.handle();
   if (dbh == nullptr) return core::Result<std::vector<InviteRow>>::Err(
