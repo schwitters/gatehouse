@@ -1,4 +1,5 @@
 #include "infra/cred_fetch_token_repo.h"
+#include "infra/sqlite_transaction.h"
 
 #include <cstdint>
 #include <optional>
@@ -65,7 +66,8 @@ core::Result<std::optional<std::string>> CredFetchTokenRepo::VerifyAndConsume(
   }
 
   // Do it in a transaction to be atomic.
-  auto tx = db_.Exec("BEGIN IMMEDIATE;");
+  SqliteTransaction transaction(db_);
+  auto tx = transaction.Begin();
   if (!tx.ok()) return core::Result<std::optional<std::string>>::Err(tx.status());
 
   // Find matching unconsumed, unexpired token.
@@ -76,7 +78,6 @@ core::Result<std::optional<std::string>> CredFetchTokenRepo::VerifyAndConsume(
       "LIMIT 1;";
   int rc = sqlite3_prepare_v2(dbh, sel_sql, -1, &sel, nullptr);
   if (rc != SQLITE_OK) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<std::optional<std::string>>::Err(StmtErr(rc, dbh, "prepare(select)"));
   }
 
@@ -89,7 +90,6 @@ core::Result<std::optional<std::string>> CredFetchTokenRepo::VerifyAndConsume(
   rc = sqlite3_step(sel);
   if (rc != SQLITE_ROW) {
     sqlite3_finalize(sel);
-    (void)db_.Exec("ROLLBACK;");
     if (rc == SQLITE_DONE) {
       return core::Result<std::optional<std::string>>::Ok(std::nullopt);
     }
@@ -108,7 +108,6 @@ core::Result<std::optional<std::string>> CredFetchTokenRepo::VerifyAndConsume(
   const char* upd_sql = "UPDATE cred_fetch_token SET consumed_at=? WHERE cft_id=? AND consumed_at IS NULL;";
   rc = sqlite3_prepare_v2(dbh, upd_sql, -1, &upd, nullptr);
   if (rc != SQLITE_OK) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<std::optional<std::string>>::Err(StmtErr(rc, dbh, "prepare(update)"));
   }
   (void)sqlite3_bind_int64(upd, 1, now);
@@ -117,11 +116,10 @@ core::Result<std::optional<std::string>> CredFetchTokenRepo::VerifyAndConsume(
   rc = sqlite3_step(upd);
   sqlite3_finalize(upd);
   if (rc != SQLITE_DONE) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<std::optional<std::string>>::Err(StmtErr(rc, dbh, "step(update)"));
   }
 
-  auto cm = db_.Exec("COMMIT;");
+  auto cm = transaction.Commit();
   if (!cm.ok()) return core::Result<std::optional<std::string>>::Err(cm.status());
 
   return core::Result<std::optional<std::string>>::Ok(std::optional<std::string>(ticket_id));

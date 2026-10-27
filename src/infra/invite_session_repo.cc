@@ -1,4 +1,6 @@
 #include "infra/invite_session_repo.h"
+#include "infra/sqlite_transaction.h"
+#include <memory>
 
 #include <optional>
 #include <string>
@@ -96,6 +98,21 @@ core::Result<void> InviteSessionRepo::DeleteExpired(std::int64_t now) {
   sqlite3* dbh = db_.handle();
   if (!dbh) return core::Result<void>::Err(core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
 
+  SqliteTransaction transaction(db_);
+  auto begun = transaction.Begin();
+  if (!begun.ok()) return begun;
+  sqlite3_stmt* children = nullptr;
+  const char* children_sql = R"SQL(
+    DELETE FROM invite_otp
+    WHERE sid IN (SELECT sid FROM invite_session WHERE expires_at <= ?)
+  )SQL";
+  int child_rc = sqlite3_prepare_v2(dbh, children_sql, -1, &children, nullptr);
+  std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> child_guard(children, sqlite3_finalize);
+  if (child_rc != SQLITE_OK) return core::Result<void>::Err(StmtErr(child_rc, dbh, "prepare(expired OTPs)"));
+  child_rc = sqlite3_bind_int64(children, 1, now);
+  if (child_rc == SQLITE_OK) child_rc = sqlite3_step(children);
+  if (child_rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(child_rc, dbh, "delete(expired OTPs)"));
+
   sqlite3_stmt* stmt = nullptr;
   const char* sql = "DELETE FROM invite_session WHERE expires_at <= ?;";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
@@ -106,7 +123,7 @@ core::Result<void> InviteSessionRepo::DeleteExpired(std::int64_t now) {
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
   if (rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(rc, dbh, "step(delete expired invite_session)"));
-  return core::Result<void>::Ok();
+  return transaction.Commit();
 }
 
 // ---- profile ----

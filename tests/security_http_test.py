@@ -70,6 +70,20 @@ with tempfile.TemporaryDirectory(prefix="gatehouse-http-") as directory:
             assert status == 401
             with sqlite3.connect(database) as db:
                 assert db.execute("SELECT status FROM invite").fetchone()[0] == 6
+            # Missing provisioning configuration must never report a completed account.
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE invite SET status=3, revoked_at=NULL")
+            status, _, _ = request("POST", "/invite/complete", urllib.parse.urlencode(
+                {"_csrf": accepted_sid, "password": "password1", "password_confirm": "password1"}), cookie)
+            assert status == 503
+            with sqlite3.connect(database) as db:
+                assert db.execute("SELECT status FROM invite").fetchone()[0] == 3
+                assert db.execute("SELECT stage FROM provisioning_job").fetchone()[0] == 0
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                statuses = list(pool.map(lambda _: request("GET", "/login")[0], range(40)))
+            assert all(status == 200 for status in statuses)
+            assert request("GET", "/assets/portal.js")[0] == 200
             # Accounts behind the same peer must have independent budgets.
             for attempt in range(11):
                 status, _, _ = request("POST", "/auth/login", "username=a%40FOREIGN.INVALID&password=p")

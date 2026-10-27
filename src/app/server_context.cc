@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "app/http_utils.h"
+#include "infra/logging.h"
 #include "core/crypto_aead.h"
 #include "core/hex.h"
 #include "core/random.h"
@@ -80,8 +81,10 @@ std::vector<std::uint8_t> HashRemoteIp(const std::string& ip) {
 }
 
 static void GcSessions(ServerContext& ctx) {
-  (void)ctx.sessions.DeleteExpired(core::UnixNow());
-  (void)ctx.invite_sessions.DeleteExpired(core::UnixNow());
+  const auto sessions = ctx.sessions.DeleteExpired(core::UnixNow());
+  if (!sessions.ok()) infra::LogOperationFailure("session cleanup");
+  const auto invitations = ctx.invite_sessions.DeleteExpired(core::UnixNow());
+  if (!invitations.ok()) infra::LogOperationFailure("invitation session cleanup");
 }
 
 std::optional<infra::SessionRow> RequireAuth(ServerContext& ctx,

@@ -97,6 +97,12 @@ add_executable(gatehouse
   src/app/routes_admin.cc
   src/app/routes_guacamole.cc
   src/app/auth.cc
+  src/app/invite_view.cc
+  src/app/invite_service.cc
+  src/core/provisioning.cc
+  src/infra/provision_store.cc
+  src/infra/logging.cc
+  src/infra/sqlite_transaction.cc
   src/app/email_sender.cc
   src/infra/invite_repo.cc
   src/infra/invite_session_repo.cc
@@ -138,7 +144,7 @@ target_link_libraries(gatehouse
 )
 
 target_compile_definitions(gatehouse PRIVATE
-  GATEHOUSE_VERSION="0.0.11"
+  GATEHOUSE_VERSION="${PROJECT_VERSION}"
 )
 
 # Treat dependency headers as SYSTEM to suppress their warnings.
@@ -179,6 +185,7 @@ target_link_libraries(gatehouse PRIVATE CURL::libcurl)
 # ----------------------------
 add_library(gatehouse_core_lib STATIC
   src/core/result.cc
+  src/core/provisioning.cc
   src/core/crypto_aead.cc
   src/core/hex.cc
   src/core/random.cc
@@ -250,3 +257,61 @@ add_test(NAME gatehouse_http_security
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/security_http_test.py
           $<TARGET_FILE:gatehouse> ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(gatehouse_http_security PROPERTIES TIMEOUT 30)
+
+# Compile trusted web assets into the binary; edits trigger CMake regeneration.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/login.html"
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/admin_invites.html"
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/portal.js"
+)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/web/login.html" ASSET_login)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/web/admin_invites.html" ASSET_admin_invites)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/web/portal.js" ASSET_portal_js)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/web/admin_tenants.js")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/web/admin_tenants.js" ASSET_admin_tenants_js)
+configure_file(web/web_assets.h.in generated/web_assets.h @ONLY)
+target_include_directories(gatehouse PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+add_executable(gatehouse_workflow_tests
+  tests/provisioning_test.cc
+  tests/database_test.cc
+  src/infra/invite_otp_repo.cc
+  src/infra/cred_fetch_token_repo.cc
+  src/infra/sqlite_db.cc
+  src/infra/logging.cc
+  src/infra/sqlite_transaction.cc
+  src/infra/provision_store.cc
+  src/infra/migrate.cc
+  src/infra/invite_session_repo.cc)
+target_link_libraries(gatehouse_workflow_tests PRIVATE
+  gatehouse_core_lib SQLite::SQLite3 GTest::gtest_main gatehouse_warnings)
+gtest_discover_tests(gatehouse_workflow_tests WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+if (_crow_inc)
+  target_include_directories(gatehouse_security_tests SYSTEM PRIVATE ${_crow_inc})
+endif()
+
+option(GATEHOUSE_WARNINGS_AS_ERRORS "Treat project warnings as errors" OFF)
+if (GATEHOUSE_WARNINGS_AS_ERRORS)
+  target_compile_options(gatehouse_warnings INTERFACE -Werror)
+endif()
+add_test(NAME gatehouse_reconcile_smoke
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/reconcile-provisioning.py --help)
+add_test(NAME gatehouse_dependency_audit_smoke
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-dependencies.py --help)
+add_test(NAME gatehouse_staging_integration
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/staging_integration_test.py
+          $<TARGET_FILE:gatehouse> ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(gatehouse_staging_integration PROPERTIES
+  SKIP_RETURN_CODE 77 LABELS staging TIMEOUT 300)
+add_test(NAME gatehouse_tooling_tests
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tooling_test.py)
+
+# GCC's optimized analysis reports potential null dereferences inside Boost.Asio
+# executor/scheduler internals when instantiating Crow's server loop. Keep those
+# warnings visible without turning third-party diagnostics into a project error.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/app/http_server.cc PROPERTIES
+    COMPILE_OPTIONS "-Wno-error=null-dereference")
+endif()

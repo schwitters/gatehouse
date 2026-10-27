@@ -1,4 +1,5 @@
 #include "infra/xrdp_otp_repo.h"
+#include "infra/sqlite_transaction.h"
 
 #include <cstdint>
 #include <optional>
@@ -70,7 +71,8 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
         core::Status::Error(core::StatusCode::kFailedPrecondition, "DB not open"));
   }
 
-  auto tx = db_.Exec("BEGIN IMMEDIATE;");
+  SqliteTransaction transaction(db_);
+  auto tx = transaction.Begin();
   if (!tx.ok()) return core::Result<bool>::Err(tx.status());
 
   sqlite3_stmt* sel = nullptr;
@@ -81,7 +83,6 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
       "ORDER BY issued_at DESC LIMIT 1;";
   int rc = sqlite3_prepare_v2(dbh, sel_sql, -1, &sel, nullptr);
   if (rc != SQLITE_OK) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "prepare(select)"));
   }
 
@@ -91,7 +92,6 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   rc = sqlite3_step(sel);
   if (rc != SQLITE_ROW) {
     sqlite3_finalize(sel);
-    (void)db_.Exec("ROLLBACK;");
     if (rc == SQLITE_DONE) return core::Result<bool>::Ok(false);
     return core::Result<bool>::Err(StmtErr(rc, dbh, "step(select)"));
   }
@@ -111,7 +111,6 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   sqlite3_finalize(sel);
 
   if (expires_at <= now || attempts >= max_attempts) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Ok(false);
   }
 
@@ -126,7 +125,6 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
       "WHERE xrdp_otp_id = ?;";
   rc = sqlite3_prepare_v2(dbh, upd_sql, -1, &upd, nullptr);
   if (rc != SQLITE_OK) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "prepare(update)"));
   }
   (void)sqlite3_bind_int(upd, 1, matched ? 1 : 0);
@@ -136,11 +134,10 @@ core::Result<bool> XrdpOtpRepo::VerifyAndConsume(const std::string& uid, const s
   rc = sqlite3_step(upd);
   sqlite3_finalize(upd);
   if (rc != SQLITE_DONE) {
-    (void)db_.Exec("ROLLBACK;");
     return core::Result<bool>::Err(StmtErr(rc, dbh, "step(update)"));
   }
 
-  auto cm = db_.Exec("COMMIT;");
+  auto cm = transaction.Commit();
   if (!cm.ok()) return core::Result<bool>::Err(cm.status());
 
   return core::Result<bool>::Ok(matched);

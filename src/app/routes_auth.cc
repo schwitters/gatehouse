@@ -1,4 +1,5 @@
 #include "app/routes.h"
+#include "web_assets.h"
 
 #include <cstdio>
 #include <string>
@@ -16,35 +17,17 @@ namespace gatehouse::app {
 
 namespace {
 
-const char* kLoginPageTemplate = R"LOGIN(<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>%TITLE% Login</title>
-<style>
-body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:640px}
-label{display:block;margin-top:16px} input{width:100%;padding:10px;margin-top:6px}
-button{margin-top:16px;padding:10px 14px}
-.err{color:#b00020;margin-top:10px}
-.hint{color:#555;margin-top:8px;font-size:0.9em}
-code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
-</style></head>
-<body>
-<h1>%TITLE%</h1>
-<form method="post" action="%B%/auth/login">
-  <label>Username <input name="username" autocomplete="username" required></label>
-  <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
-  <button type="submit">Sign in</button>
-</form>
-%ERROR%
-</body></html>)LOGIN";
+const char* kLoginPageTemplate = assets::k_login;
 
 }  // namespace
 
 void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
-  const std::string& B = ctx.cfg.base_uri;
+  const std::string& base_uri = ctx.cfg.base_uri;
 
   // ---- HTML login page ----
-  app.route_dynamic(B + "/login").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/login").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
     std::string page = ApplyTitle(kLoginPageTemplate, ctx.cfg.instance_title);
@@ -63,8 +46,9 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Logout ----
-  app.route_dynamic(B + "/auth/logout").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/auth/logout").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
     auto s = RequireAuth(ctx, req);
@@ -72,7 +56,10 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       return HtmlPage(403, "<h1>Invalid CSRF token</h1>");
     }
     const std::string sid = CookieValueFromHeader(req, ctx.cfg.session_cookie_name);
-    if (!sid.empty()) (void)ctx.sessions.DeleteBySid(sid);
+    if (!sid.empty()) {
+      const auto deleted = ctx.sessions.DeleteBySid(sid);
+      if (!deleted.ok()) return HtmlPage(503, "<h1>Logout could not finish</h1>");
+    }
     auto r = RedirectTo(B + "/login");
     r.add_header("Set-Cookie",
                  ctx.cfg.session_cookie_name + "=deleted; Path=" + cookie_path + "; Max-Age=0; HttpOnly; SameSite=Lax");
@@ -81,8 +68,9 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- HTML form login ----
-  app.route_dynamic(B + "/auth/login").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/auth/login").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
 
@@ -167,8 +155,9 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- JSON login API ----
-  app.route_dynamic(B + "/api/auth/login").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/auth/login").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
 

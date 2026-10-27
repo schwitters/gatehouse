@@ -153,9 +153,11 @@ core::Result<void> InviteRepo::UpdateStatus(const std::string& invite_id, Invite
   }
 
   sqlite3_stmt* stmt = nullptr;
-  const char* sql =
-      "UPDATE invite SET status=?, consumed_at=CASE WHEN ? THEN ? ELSE consumed_at END "
-      "WHERE invite_id=?;";
+  const char* sql = R"SQL(
+    UPDATE invite
+    SET status = ?, consumed_at = CASE WHEN ? THEN ? ELSE consumed_at END
+    WHERE invite_id = ? AND status NOT IN (4, 5, 6) AND COALESCE(revoked_at, 0) = 0
+  )SQL";
   int rc = sqlite3_prepare_v2(dbh, sql, -1, &stmt, nullptr);
   if (rc != SQLITE_OK) return core::Result<void>::Err(StmtErr(rc, dbh, "prepare(update_status)"));
 
@@ -168,6 +170,8 @@ core::Result<void> InviteRepo::UpdateStatus(const std::string& invite_id, Invite
   rc = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
   if (rc != SQLITE_DONE) return core::Result<void>::Err(StmtErr(rc, dbh, "step(update_status)"));
+  if (sqlite3_changes(dbh) != 1) return core::Result<void>::Err(core::Status::Error(
+      core::StatusCode::kFailedPrecondition, "Invitation is no longer mutable"));
   return core::Result<void>::Ok();
 }
 

@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>%TITLE% – Invitations</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:980px}
+    label{display:block;margin-top:14px}
+    input{width:100%;padding:10px;margin-top:6px}
+    button{margin-top:12px;padding:10px 14px}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .card{padding:16px;border:1px solid #ddd;border-radius:12px;margin-top:18px}
+    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
+    pre{background:#0b1020;color:#e6e6e6;padding:12px;border-radius:12px;overflow:auto}
+    .ok{color:#0a7a2f}
+    .err{color:#b00020}
+    a{color:#0b57d0}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;font-size:14px}
+    th{font-weight:600}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f4f4f4}
+  </style>
+</head>
+<body>
+  <h1>Invitations</h1>
+  <p><a href="%B%/portal">Back to portal</a></p>
+
+  <div class="card">
+    <h2>Create invite</h2>
+    <div class="row">
+      <div>
+        <label>Tenant OU (e.g. <code>k8s-20260118</code>)
+          <input id="tenant_ou" placeholder="k8s-20260118" autocomplete="off">
+        </label>
+      </div>
+      <div>
+        <label>User UID (e.g. <code>krm</code>)
+          <input id="uid" placeholder="krm" autocomplete="off">
+        </label>
+      </div>
+    </div>
+    <button id="btnCreate">Create invite</button>
+    <p id="statusCreate"></p>
+    <div id="outCreate"></div>
+  </div>
+
+  <div class="card">
+    <h2>Uninvited LDAP Users</h2>
+    <div class="row">
+      <div>
+        <label>Target Tenant OU
+          <input id="uninvTenant" placeholder="k8s-20260118">
+        </label>
+      </div>
+    </div>
+    <button id="btnSearchUninvited">Find Users</button>
+    <p id="statusUninvited"></p>
+    <div id="uninvitedList"></div>
+  </div>
+
+  <div class="card">
+    <h2>Latest invites</h2>
+    <div class="row">
+      <div>
+        <label>Filter tenant_ou
+          <input id="fltTenant" placeholder="(optional)">
+        </label>
+      </div>
+      <div>
+        <label>Filter uid
+          <input id="fltUid" placeholder="(optional)">
+        </label>
+      </div>
+    </div>
+    <button id="btnRefresh">Refresh list</button>
+    <p id="statusList"></p>
+    <div id="list"></div>
+  </div>
+
+<script>
+const _B='%B%';
+function getCsrfToken() {
+  const m = document.cookie.match(/(?:^|;\s*)gh_csrf=([^;]+)/);
+  return m ? m[1] : '';
+}
+
+async function apiJson(method, path, body) {
+  const opt = {method, headers: {"Content-Type":"application/json", "X-CSRF-Token": getCsrfToken()}};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(_B+path, opt);
+  const t = await r.text();
+  let j = null;
+  try { j = JSON.parse(t); } catch(e) {}
+  return {ok: r.ok, status: r.status, json: j, text: t};
+}
+
+function setStatus(id, kind, msg) {
+  const el = document.getElementById(id);
+  el.className = kind;
+  el.textContent = msg;
+}
+
+function renderJson(where, obj) {
+  const out = document.getElementById(where);
+  out.innerHTML = "";
+  const pre = document.createElement("pre");
+  pre.textContent = JSON.stringify(obj, null, 2);
+  out.appendChild(pre);
+  if (obj && obj.invite_url) {
+    const p = document.createElement("p");
+    const a = document.createElement("a");
+    a.href = obj.invite_url;
+    a.textContent = "Open invite link";
+    a.target = "_blank";
+    p.appendChild(a);
+    out.appendChild(p);
+  }
+}
+
+function renderList(items) {
+  const root = document.getElementById("list");
+  root.innerHTML = "";
+  if (!items || items.length === 0) {
+    root.textContent = "No invites.";
+    return;
+  }
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>created / dates</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>actions</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const it of items) {
+    const tr = document.createElement("tr");
+
+    const created = new Date(it.created_at * 1000).toLocaleString();
+    const expires = new Date(it.expires_at * 1000).toLocaleString();
+    let datesHtml = "<div>" + created + "</div><div style='color:#555;font-size:0.85em;margin-top:4px'>Expires: " + expires + "</div>";
+
+    if (it.consumed_at && it.consumed_at > 0) {
+        datesHtml += "<div style='color:#0a7a2f;font-size:0.85em'>Completed: " + new Date(it.consumed_at * 1000).toLocaleString() + "</div>";
+    }
+    if (it.revoked_at && it.revoked_at > 0) {
+        datesHtml += "<div style='color:#b00020;font-size:0.85em'>Revoked: " + new Date(it.revoked_at * 1000).toLocaleString() + "</div>";
+    }
+
+    let pillColor = "#f4f4f4";
+    let textColor = "#000";
+    if (it.status_name === "Completed") { pillColor = "#e6f4ea"; textColor = "#137333"; }
+    else if (it.status_name === "Revoked" || it.status_name === "Expired") { pillColor = "#fce8e6"; textColor = "#c5221f"; }
+    else if (it.status_name === "StepupVerified") { pillColor = "#e8f0fe"; textColor = "#1a73e8"; }
+
+    tr.innerHTML =
+      "<td>" + datesHtml + "</td>" +
+      "<td><code>" + it.tenant_id + "</code></td>" +
+      "<td><code>" + (it.invited_uid||"") + "</code></td>" +
+      "<td>" + it.invited_email + "</td>" +
+      "<td><span class='pill' style='background:" + pillColor + ";color:" + textColor + ";font-weight:500'>" + it.status_name + "</span></td>" +
+      "<td></td>";
+    const td = tr.querySelectorAll("td")[5];
+
+    const canRevoke = it.status !== 4 && it.status !== 5 && it.status !== 6;
+
+    if (canRevoke) {
+      const btnRevoke = document.createElement("button");
+      btnRevoke.textContent = "Revoke";
+      btnRevoke.style.marginRight = "8px";
+      btnRevoke.onclick = async () => {
+        if (!confirm("Are you sure you want to revoke this invitation for " + it.invited_email + "?")) return;
+        const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
+        if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
+        await refresh();
+      };
+      td.appendChild(btnRevoke);
+    } else if (it.invited_uid && it.tenant_id) {
+      checkAndAddResetBtn(td, it.tenant_id, it.invited_uid);
+    }
+
+    const btnResend = document.createElement("button");
+    btnResend.textContent = "Resend";
+    btnResend.onclick = async () => {
+      if (!confirm("Generate a new invite link for " + it.invited_email + "?")) return;
+      const r = await apiJson("POST", "/api/admin/invites", {tenant_ou: it.tenant_id, uid: it.invited_uid});
+      if (!r.ok) { alert("Resend failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
+      renderJson("outCreate", r.json || {});
+      setStatus("statusCreate", "ok", "Resent as new invite.");
+      await refresh();
+    };
+    td.appendChild(btnResend);
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+
+async function checkAndAddResetBtn(td, tenant_id, uid) {
+  try {
+    const r = await apiJson("GET", "/api/admin/user/krb-status?tenant_id=" + encodeURIComponent(tenant_id) + "&uid=" + encodeURIComponent(uid));
+    if (!r.ok || !r.json || !r.json.has_krb_attrs) return;
+    const btn = document.createElement("button");
+    btn.textContent = "Reset Kerberos";
+    btn.style.cssText = "margin-right:8px;background:#d93025;";
+    btn.onclick = async () => {
+      if (!confirm("Delete Kerberos attributes for " + uid + "?\n\nThis removes: krbPrincipalName, krbPrincipalKey, krbExtraData, krbLastPwdChange, krbLoginFailedCount")) return;
+      const res = await apiJson("POST", "/api/admin/user/reset-krb", {tenant_id, uid});
+      if (!res.ok) { alert("Reset failed: " + (res.json && res.json.error ? res.json.error : res.text)); return; }
+      btn.remove();
+    };
+    td.insertBefore(btn, td.firstChild);
+  } catch(e) {}
+}
+
+async function refresh() {
+  setStatus("statusList", "", "Loading...");
+  const t = document.getElementById("fltTenant").value.trim();
+  const u = document.getElementById("fltUid").value.trim();
+  const q = new URLSearchParams();
+  if (t) q.set("tenant_id", t);
+  if (u) q.set("invited_uid", u);
+  const r = await fetch(_B+"/api/admin/invites/list?" + q.toString());
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    setStatus("statusList", "err", "Error (" + r.status + ")");
+    return;
+  }
+  setStatus("statusList", "ok", "Loaded " + (j.items ? j.items.length : 0) + " invite(s).");
+  renderList(j.items || []);
+}
+
+async function searchUninvited() {
+  setStatus("statusUninvited", "", "Searching LDAP...");
+  const t = document.getElementById("uninvTenant").value.trim();
+  if (!t) { setStatus("statusUninvited", "err", "Please enter a Tenant OU."); return; }
+
+  const r = await fetch(_B+"/api/admin/uninvited?tenant_id=" + encodeURIComponent(t));
+  const j = await r.json().catch(() => null);
+  if (!r.ok) { setStatus("statusUninvited", "err", "Error: " + (j && j.error ? j.error : r.status)); return; }
+
+  const items = j.items || [];
+  setStatus("statusUninvited", "ok", "Found " + items.length + " uninvited user(s).");
+
+  const root = document.getElementById("uninvitedList");
+  root.innerHTML = "";
+  if (items.length === 0) return;
+
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>uid</th><th>email</th><th>actions</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td><code>" + it.uid + "</code></td><td>" + it.mail + "</td><td></td>";
+    const td = tr.querySelectorAll("td")[2];
+
+    const btn = document.createElement("button");
+    btn.textContent = "Send Invite";
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "Sending...";
+      const res = await apiJson("POST", "/api/admin/invites", {tenant_ou: t, uid: it.uid});
+      if (!res.ok) {
+        alert("Failed: " + (res.json && res.json.error ? res.json.error : res.text));
+        btn.disabled = false;
+        btn.textContent = "Send Invite";
+      } else {
+        btn.textContent = "Sent!";
+        await refresh();
+      }
+    };
+    td.appendChild(btn);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  root.appendChild(table);
+}
+document.getElementById("btnSearchUninvited").addEventListener("click", searchUninvited);
+
+document.getElementById("btnCreate").addEventListener("click", async () => {
+  const tenant_ou = document.getElementById("tenant_ou").value.trim();
+  const uid = document.getElementById("uid").value.trim();
+  if (!tenant_ou || !uid) { setStatus("statusCreate","err","tenant_ou and uid are required"); return; }
+  setStatus("statusCreate","", "Working...");
+  const r = await apiJson("POST", "/api/admin/invites", {tenant_ou, uid});
+  if (!r.ok) {
+    setStatus("statusCreate","err","Error ("+r.status+"): " + (r.json && r.json.error ? r.json.error : r.text));
+    if (r.json) renderJson("outCreate", r.json);
+    return;
+  }
+  setStatus("statusCreate","ok","Invite created and email queued/sent.");
+  renderJson("outCreate", r.json || {});
+  await refresh();
+});
+
+document.getElementById("btnRefresh").addEventListener("click", refresh);
+refresh();
+</script>
+</body>
+</html>

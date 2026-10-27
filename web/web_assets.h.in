@@ -1,0 +1,7 @@
+#pragma once
+namespace gatehouse::app::assets {
+inline constexpr char k_login[] = R"GH_ASSET(@ASSET_login@)GH_ASSET";
+inline constexpr char k_admin_invites[] = R"GH_ASSET(@ASSET_admin_invites@)GH_ASSET";
+inline constexpr char k_portal_js[] = R"GH_ASSET(@ASSET_portal_js@)GH_ASSET";
+inline constexpr char k_admin_tenants_js[] = R"GH_ASSET(@ASSET_admin_tenants_js@)GH_ASSET";
+}

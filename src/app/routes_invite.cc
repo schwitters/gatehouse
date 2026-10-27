@@ -4,6 +4,8 @@
 #include <string>
 
 #include "app/http_utils.h"
+#include "app/invite_service.h"
+#include "app/invite_view.h"
 #include "core/crypto_aead.h"
 #include "core/hex.h"
 #include "core/random.h"
@@ -13,16 +15,17 @@
 #include "crow.h"
 #include "crow/json.h"
 #include "infra/invite_session_repo.h"
-#include "infra/kadm5_client.h"
+#include "infra/sqlite_transaction.h"
 
 namespace gatehouse::app {
 
 void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
-  const std::string& B = ctx.cfg.base_uri;
+  const std::string& base_uri = ctx.cfg.base_uri;
 
   // ---- Accept invite token -> invite_session cookie ----
-  app.route_dynamic(B + "/invite/accept").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/invite/accept").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
     const char* t = req.url_params.get("token");
@@ -35,14 +38,13 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     auto hash = core::Sha256(token_bytes.value());
     if (!hash.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
-    // BEGIN IMMEDIATE transaction to prevent race condition: two concurrent
-    // requests with the same token must not both create valid invite sessions.
-    auto tx = ctx.db.Exec("BEGIN IMMEDIATE;");
+    infra::SqliteTransaction transaction(ctx.db);
+    auto tx = transaction.Begin();
     if (!tx.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
     auto row = ctx.invites.GetByTokenHash(hash.value());
-    if (!row.ok() || !row.value().has_value()) {
-      (void)ctx.db.Exec("ROLLBACK;");
+    if (!row.ok()) return HtmlPage(503, "<h1>Invitation lookup failed</h1>");
+    if (!row.value().has_value()) {
       return HtmlPage(404, "<h1>Invitation not found</h1>");
     }
 
@@ -50,24 +52,27 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const auto& inv = *row.value();
 
     if (inv.revoked_at != 0 || inv.status == infra::InviteStatus::kRevoked) {
-      (void)ctx.db.Exec("ROLLBACK;");
       return HtmlPage(410, "<h1>Invitation revoked</h1>");
     }
     if (inv.status == infra::InviteStatus::kCompleted) {
-      (void)ctx.db.Exec("ROLLBACK;");
       return HtmlPage(410, "<h1>Invitation already completed</h1>");
     }
+    if (inv.status == infra::InviteStatus::kExpired) {
+      return HtmlPage(410, "<h1>Invitation expired</h1>");
+    }
     if (inv.expires_at <= now) {
-      (void)ctx.invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kExpired, now);
-      (void)ctx.db.Exec("COMMIT;");
+      auto expired = ctx.invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kExpired, now);
+      if (!expired.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
+      auto committed = transaction.Commit();
+      if (!committed.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
       return HtmlPage(410, "<h1>Invitation expired</h1>");
     }
 
-    (void)ctx.invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kLinkVerified, now);
+    auto linked = ctx.invites.UpdateStatus(inv.invite_id, infra::InviteStatus::kLinkVerified, now);
+    if (!linked.ok()) return HtmlPage(409, "<h1>Invitation unavailable</h1>");
 
     auto sid_bytes = core::RandomBytes(32);
     if (!sid_bytes.ok()) {
-      (void)ctx.db.Exec("ROLLBACK;");
       return HtmlPage(500, "<h1>Internal error</h1>");
     }
 
@@ -79,11 +84,10 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     auto ins = ctx.invite_sessions.Insert(s);
     if (!ins.ok()) {
-      (void)ctx.db.Exec("ROLLBACK;");
       return HtmlPage(500, "<h1>Internal error</h1>");
     }
 
-    auto cm = ctx.db.Exec("COMMIT;");
+    auto cm = transaction.Commit();
     if (!cm.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
     auto r = RedirectTo(B + "/invite/complete");
@@ -94,15 +98,17 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Complete invite wizard (GET) ----
-  app.route_dynamic(B + "/invite/complete").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/invite/complete").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value())
       return HtmlPage(401, "<h1>Invitation session expired</h1><p>Please open your invite link again.</p>");
 
     auto inv = ctx.invites.GetById(is->invite_id);
-    if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+    if (!inv.ok()) return HtmlPage(503, "<h1>Invitation lookup failed</h1>");
+    if (!inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
     const auto& row = *inv.value();
     if (row.status == infra::InviteStatus::kRevoked) return HtmlPage(410, "<h1>Invitation revoked</h1>");
 
@@ -116,103 +122,16 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string sent = req.url_params.get("sent") ? req.url_params.get("sent") : "";
     const std::string err  = req.url_params.get("err")  ? req.url_params.get("err")  : "";
 
-    // Wizard steps: 1=send code  2=enter code  3=set password
-    const int wizard_step = verified ? 3 : (!sent.empty() ? 2 : 1);
-
-    // Use the invite session SID as CSRF token: HttpOnly, embedded in HTML by server.
-    const std::string inv_csrf = HtmlEscape(is->sid);
-
-    auto wstep_class = [&](int n) -> std::string {
-      if (n < wizard_step) return "wstep done";
-      if (n == wizard_step) return "wstep active";
-      return "wstep";
-    };
-
-    std::string html;
-    html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>Complete Invitation \xe2\x80\x93 " + HtmlEscape(ctx.cfg.instance_title) + "</title><style>";
-    html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f0f4f9;color:#222}";
-    html += ".wrap{max-width:520px;margin:48px auto;padding:0 16px}";
-    html += "h1{font-size:1.5rem;margin:0 0 4px}";
-    html += ".subtitle{color:#555;font-size:.9em;margin:0 0 28px}";
-    html += ".wizard{display:flex;margin-bottom:32px;border-radius:10px;overflow:hidden;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.08)}";
-    html += ".wstep{flex:1;text-align:center;padding:12px 6px;font-size:12px;font-weight:500;color:#aaa;border-bottom:3px solid transparent;transition:all .2s}";
-    html += ".wstep.done{color:#137333;border-bottom-color:#137333}";
-    html += ".wstep.active{color:#0b57d0;border-bottom-color:#0b57d0;font-weight:700}";
-    html += ".card{background:#fff;padding:28px 28px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);margin-bottom:20px}";
-    html += "h2{margin:0 0 8px;font-size:1.15rem}";
-    html += ".info-row{display:flex;gap:6px;align-items:center;font-size:.88em;color:#555;margin-bottom:4px}";
-    html += ".info-row b{color:#222}";
-    html += "label{display:block;margin-top:18px;font-size:.9em;font-weight:600;color:#333}";
-    html += "input{width:100%;padding:11px 12px;margin-top:6px;border:1px solid #ccc;border-radius:7px;font-size:1em;box-sizing:border-box;transition:border-color .15s}";
-    html += "input:focus{outline:none;border-color:#0b57d0;box-shadow:0 0 0 3px rgba(11,87,208,.12)}";
-    html += ".code-input{letter-spacing:6px;font-size:1.6em;text-align:center}";
-    html += ".btn{display:inline-block;margin-top:20px;padding:12px 20px;border:none;border-radius:7px;font-size:1em;font-weight:600;cursor:pointer;width:100%;text-align:center}";
-    html += ".btn-primary{background:#0b57d0;color:#fff} .btn-primary:hover{background:#0842a0}";
-    html += ".btn-ghost{background:#f0f0f0;color:#333;margin-top:12px} .btn-ghost:hover{background:#e0e0e0}";
-    html += ".alert-err{background:#fce8e6;color:#c5221f;border-radius:7px;padding:10px 14px;margin-top:14px;font-size:.9em}";
-    html += ".alert-info{background:#e8f0fe;color:#1a73e8;border-radius:7px;padding:10px 14px;margin-top:14px;font-size:.9em}";
-    html += "a{color:#0b57d0;font-weight:600}";
-    html += "</style></head><body><div class='wrap'>";
-
-    html += "<h1>Complete Invitation</h1>";
-    html += "<p class='subtitle'>Tenant: <b>" + HtmlEscape(row.tenant_id) + "</b> &nbsp;&middot;&nbsp; User: <b>" + HtmlEscape(row.invited_uid) + "</b></p>";
-
-    html += "<div class='wizard'>";
-    html += "<div class='" + wstep_class(1) + "'>1. Verify Email</div>";
-    html += "<div class='" + wstep_class(2) + "'>2. Enter Code</div>";
-    html += "<div class='" + wstep_class(3) + "'>3. Set Password</div>";
-    html += "</div>";
-
-    if (wizard_step == 1) {
-      html += "<div class='card'>";
-      html += "<h2>Verify your email address</h2>";
-      html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We'll send a 6-digit code to:</p>";
-      html += "<div class='info-row' style='margin-top:8px'><b>" + HtmlEscape(row.invited_email) + "</b></div>";
-      if (!err.empty()) html += "<div class='alert-err'>Error: " + HtmlEscape(err) + "</div>";
-      html += "<form method='post' action='" + B + "/invite/otp/send'>";
-      html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-      html += "<button type='submit' class='btn btn-primary'>Send Verification Code</button>";
-      html += "</form></div>";
-    } else if (wizard_step == 2) {
-      html += "<div class='card'>";
-      html += "<h2>Enter verification code</h2>";
-      html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We sent a 6-digit code to <b>" + HtmlEscape(row.invited_email) + "</b>.<br>It expires in 10&nbsp;minutes.</p>";
-      if (!err.empty()) html += "<div class='alert-err'>Error: " + HtmlEscape(err) + "</div>";
-      html += "<form method='post' action='" + B + "/invite/otp/verify'>";
-      html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-      html += "<label>Verification code";
-      html += "<input name='code' class='code-input' placeholder='123456' autocomplete='one-time-code' inputmode='numeric' maxlength='6' required></label>";
-      html += "<button type='submit' class='btn btn-primary'>Verify Code</button>";
-      html += "</form>";
-      html += "<form method='post' action='" + B + "/invite/otp/send'>";
-      html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-      html += "<button type='submit' class='btn btn-ghost'>Resend Code</button>";
-      html += "</form></div>";
-    } else {
-      html += "<div class='card'>";
-      html += "<h2>Set up your account</h2>";
-      html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>Email verified. Choose a password to complete your registration.</p>";
-      if (!err.empty()) html += "<div class='alert-err'>Error: " + HtmlEscape(err) + "</div>";
-      html += "<form method='post' action='" + B + "/invite/complete'>";
-      html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
-      html += "<label>Display name <span style='color:#aaa;font-weight:400'>(optional)</span>";
-      html += "<input name='display_name' placeholder='Your full name' value='" + HtmlEscape(display) + "'></label>";
-      html += "<label>New password <span style='color:#b00020'>*</span>";
-      html += "<input type='password' name='password' required minlength='8' autocomplete='new-password'></label>";
-      html += "<label>Confirm password <span style='color:#b00020'>*</span>";
-      html += "<input type='password' name='password_confirm' required minlength='8' autocomplete='new-password'></label>";
-      html += "<button type='submit' class='btn btn-primary'>Complete Setup</button>";
-      html += "</form></div>";
-    }
-
-    html += "</div></body></html>";
+    const std::string html = RenderInvitation({
+        ctx.cfg.instance_title, B, is->sid, row.tenant_id, row.invited_uid,
+        row.invited_email, display, err, verified, !sent.empty()});
     return HtmlPage(200, html);
   });
 
   // ---- Complete invite wizard (POST) ----
-  app.route_dynamic(B + "/invite/complete").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/invite/complete").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
@@ -230,9 +149,9 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     }
 
     auto inv = ctx.invites.GetById(is->invite_id);
-    if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+    if (!inv.ok()) return HtmlPage(503, "<h1>Invitation lookup failed</h1>");
+    if (!inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
 
-    const auto now = core::UnixNow();
     const std::string display = core::FormGet(req.body, "display_name").value_or("");
     const std::string pwd1 = core::FormGet(req.body, "password").value_or("");
     const std::string pwd2 = core::FormGet(req.body, "password_confirm").value_or("");
@@ -244,50 +163,11 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       return RedirectTo(B + "/invite/complete?err=Password+must+be+at+least+8+characters");
     }
 
-    const char* env_kadmin_princ = std::getenv("GATEHOUSE_KADM5_ADMIN_PRINC");
-    const char* env_kadmin_pass  = std::getenv("GATEHOUSE_KADM5_ADMIN_PASS");
-
-    if (env_kadmin_princ && env_kadmin_pass && ctx.ldap_dir.has_value()) {
-      infra::Kadm5Config kcfg;
-      kcfg.realm = ctx.cfg.auth_cfg.krb5_realm;
-      kcfg.admin_principal = env_kadmin_princ;
-      kcfg.admin_password  = env_kadmin_pass;
-      infra::Kadm5Client kadm(kcfg);
-
-      auto dn_res = ctx.ldap_dir->GetUserDn(inv.value()->tenant_id, inv.value()->invited_uid);
-      if (dn_res.ok() && dn_res.value().has_value()) {
-        std::string new_princ = inv.value()->invited_uid + "@" + ctx.cfg.auth_cfg.krb5_realm;
-        auto krc = kadm.CreatePrincipal(new_princ, pwd1, dn_res.value().value());
-        if (!krc.ok()) {
-          std::fprintf(stderr, "[gatehouse][kadm5] Failed to create principal: %s\n",
-                       SanitizeForLog(krc.status().ToString()).c_str());
-          return RedirectTo(B + "/invite/complete?err=Failed+to+create+Kerberos+principal");
-        }
-      }
-    }
-
-    infra::InviteProfileRow pr;
-    pr.invite_id   = is->invite_id;
-    pr.display_name = display;
-    pr.created_at  = now;
-    pr.updated_at  = now;
-
-    const auto profile_result = ctx.invite_profiles.Upsert(pr);
-    if (!profile_result.ok()) return HtmlPage(500, "<h1>Profile storage failed</h1>");
-    const auto completion_result = ctx.invites.UpdateStatus(
-        is->invite_id, infra::InviteStatus::kCompleted, now);
-    if (!completion_result.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
-    const auto consume_result = ctx.invite_sessions.Consume(is->sid, now);
-    if (!consume_result.ok()) return HtmlPage(500, "<h1>Session update failed</h1>");
-
-    // Activate user in LDAP.
-    if (ctx.ldap_dir.has_value() && !inv.value()->invited_uid.empty()) {
-      auto act_rc = ctx.ldap_dir->ActivateUser(inv.value()->tenant_id, inv.value()->invited_uid);
-      if (!act_rc.ok()) {
-        std::fprintf(stderr, "[gatehouse][activate] Warning: LDAP activation failed for %s: %s\n",
-                     SanitizeForLog(inv.value()->invited_uid).c_str(),
-                     SanitizeForLog(act_rc.status().ToString()).c_str());
-      }
+    const auto completed = CompleteInvitation(ctx, {
+        is->invite_id, is->sid, display, pwd1});
+    if (!completed.ok()) {
+      return HtmlPage(503, "<h1>Account setup could not finish</h1>"
+                           "<p>Please retry later or contact an administrator.</p>");
     }
 
     std::string done_html;
@@ -325,8 +205,9 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Send OTP email ----
-  app.route_dynamic(B + "/invite/otp/send").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/invite/otp/send").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
@@ -349,7 +230,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     }
 
     auto inv = ctx.invites.GetById(is->invite_id);
-    if (!inv.ok() || !inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
+    if (!inv.ok()) return HtmlPage(503, "<h1>Invitation lookup failed</h1>");
+    if (!inv.value().has_value()) return HtmlPage(404, "<h1>Invitation not found</h1>");
     const auto& row = *inv.value();
 
     // Refresh email from LDAP in case it changed since the invite was created.
@@ -366,7 +248,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
         std::fprintf(stderr, "[gatehouse][invite] email updated for %s/%s: %s -> %s\n",
                      row.tenant_id.c_str(), row.invited_uid.c_str(),
                      row.invited_email.c_str(), fresh_mail->c_str());
-        (void)ctx.invites.UpdateEmail(row.invite_id, *fresh_mail);
+        const auto updated = ctx.invites.UpdateEmail(row.invite_id, *fresh_mail);
+        if (!updated.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
         send_to_email = *fresh_mail;
       }
     }
@@ -390,7 +273,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     auto h = core::Sha256(otp_bytes);
     if (!h.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
 
-    (void)ctx.invite_otps.DeleteBySid(is->sid);
+    const auto removed = ctx.invite_otps.DeleteBySid(is->sid);
+    if (!removed.ok()) return HtmlPage(500, "<h1>OTP update failed</h1>");
 
     auto otp_id_bytes = core::RandomBytes(16);
     if (!otp_id_bytes.ok()) return HtmlPage(500, "<h1>Internal error</h1>");
@@ -415,13 +299,15 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     auto mail_rc = ctx.email.SendText(send_to_email, subject, body_txt);
     if (!mail_rc.ok()) return HtmlPage(502, "<h1>Mail send failed</h1>");
 
-    (void)ctx.invites.UpdateStatus(row.invite_id, infra::InviteStatus::kStepupSent, now);
+    const auto sent_status = ctx.invites.UpdateStatus(row.invite_id, infra::InviteStatus::kStepupSent, now);
+    if (!sent_status.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
     return RedirectTo(B + "/invite/complete?sent=1");
   });
 
   // ---- Verify OTP ----
-  app.route_dynamic(B + "/invite/otp/verify").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/invite/otp/verify").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
@@ -445,7 +331,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     auto inv_otp = ctx.invites.GetById(is->invite_id);
     if (inv_otp.ok() && inv_otp.value().has_value()) {
-      (void)ctx.invites.UpdateStatus(is->invite_id, infra::InviteStatus::kStepupVerified, now);
+      const auto verified_status = ctx.invites.UpdateStatus(is->invite_id, infra::InviteStatus::kStepupVerified, now);
+      if (!verified_status.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
     }
     return RedirectTo(B + "/invite/complete?ok=1");
   });

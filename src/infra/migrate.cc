@@ -1,4 +1,5 @@
 #include "infra/migrate.h"
+#include "infra/sqlite_transaction.h"
 
 #include <fstream>
 #include <sstream>
@@ -19,21 +20,12 @@ core::Result<std::string> ReadFileToString(const std::string& path) {
 }
 
 core::Result<void> ExecTx(SqliteDb& db, const std::string& sql) {
-  auto rc = db.Exec("BEGIN IMMEDIATE;");
-  if (!rc.ok()) return rc;
-
-  rc = db.Exec(sql);
-  if (!rc.ok()) {
-    (void)db.Exec("ROLLBACK;");
-    return rc;
-  }
-
-  rc = db.Exec("COMMIT;");
-  if (!rc.ok()) {
-    (void)db.Exec("ROLLBACK;");
-    return rc;
-  }
-  return core::Result<void>::Ok();
+  SqliteTransaction transaction(db);
+  auto begun = transaction.Begin();
+  if (!begun.ok()) return begun;
+  auto executed = db.Exec(sql);
+  if (!executed.ok()) return executed;
+  return transaction.Commit();
 }
 
 }  // namespace
@@ -42,6 +34,10 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
   auto v = db.GetPragmaUserVersion();
   if (!v.ok()) return core::Result<void>::Err(v.status());
 
+  if (v.value() > 7) {
+    return core::Result<void>::Err(core::Status::Error(
+        core::StatusCode::kFailedPrecondition, "Database schema is newer than this executable"));
+  }
   if (v.value() == 0) {
     auto sql = ReadFileToString(cfg.schema_v1_path);
     if (!sql.ok()) return core::Result<void>::Err(sql.status());
@@ -104,6 +100,13 @@ core::Result<void> Migrate(SqliteDb& db, const MigrateConfig& cfg) {
     if (!rc.ok()) return rc;
     auto u = db.SetPragmaUserVersion(6);
     if (!u.ok()) return u;
+    v = db.GetPragmaUserVersion();
+    if (!v.ok()) return core::Result<void>::Err(v.status());
+  }
+  if (v.value() == 6) {
+    const auto sql = ReadFileToString(cfg.schema_v7_path);
+    if (!sql.ok()) return core::Result<void>::Err(sql.status());
+    return ExecTx(db, sql.value());
   }
 
   return core::Result<void>::Ok();
