@@ -216,6 +216,10 @@ core::Result<LdapHandle> ConnectAndBind(const LdapConfig& cfg) {
         "LDAP config incomplete (url/bind_dn/base_dn)"));
   }
 
+  if (!IsLdapsUrl(cfg.url) && !IsLdapiUrl(cfg.url) && !cfg.starttls) {
+    return core::Result<LdapHandle>::Err(core::Status::Error(
+        core::StatusCode::kFailedPrecondition, "LDAP requires TLS"));
+  }
   LDAP* raw = nullptr;
   const int init_rc = ldap_initialize(&raw, cfg.url.c_str());
   if (init_rc != LDAP_SUCCESS || raw == nullptr) {
@@ -240,19 +244,16 @@ core::Result<LdapHandle> ConnectAndBind(const LdapConfig& cfg) {
         LErr("ldap_set_option(NETWORK_TIMEOUT)", rc));
   }
 
-  if (cfg.starttls && !IsLdapsUrl(cfg.url)) {
-    // MED-06: Require server certificate verification before upgrading to TLS.
-    int tls_req = LDAP_OPT_X_TLS_DEMAND;
-    (void)ldap_set_option(ld.get(), LDAP_OPT_X_TLS_REQUIRE_CERT, &tls_req);
+  int tls_req = LDAP_OPT_X_TLS_DEMAND;
+  rc = ldap_set_option(ld.get(), LDAP_OPT_X_TLS_REQUIRE_CERT, &tls_req);
+  if (rc != LDAP_OPT_SUCCESS) {
+    return core::Result<LdapHandle>::Err(LErr("ldap_set_option(REQUIRE_CERT)", rc));
+  }
+  if (cfg.starttls && !IsLdapsUrl(cfg.url) && !IsLdapiUrl(cfg.url)) {
     rc = ldap_start_tls_s(ld.get(), nullptr, nullptr);
     if (rc != LDAP_SUCCESS) {
       return core::Result<LdapHandle>::Err(LErr("ldap_start_tls_s", rc));
     }
-  } else if (!IsLdapsUrl(cfg.url) && !IsLdapiUrl(cfg.url)) {
-    std::fprintf(stderr,
-                 "[gatehouse][ldap] WARNING: connecting without TLS (%s). "
-                 "Credentials will be transmitted in plaintext.\n",
-                 cfg.url.c_str());
   }
 
   struct berval cred;

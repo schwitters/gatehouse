@@ -5,6 +5,9 @@ Documentation=man:gatehouse(8)
 
 [Service]
 Type=simple
+DynamicUser=yes
+UMask=0077
+CapabilityBoundingSet=
 ExecStart=/usr/sbin/gatehouse \
     --db /var/lib/gatehouse/gatehouse.db \
     --port 18080 \

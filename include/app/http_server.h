@@ -32,7 +32,7 @@ struct HttpServerConfig {
   // Invitations
   std::string public_base_url{"http://127.0.0.1:18080"};
   std::int64_t invite_ttl_seconds{7 * 24 * 60 * 60};
-  std::vector<std::string> admin_uids{"demo"};
+  std::vector<std::string> admin_uids;
   std::string ldap_admin_group;
 
   // Email backends: "console" (default) | "curl"

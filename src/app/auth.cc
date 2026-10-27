@@ -27,6 +27,13 @@ core::Result<std::optional<LoginPrincipal>> AuthService::Verify(const LoginReque
         core::Status::Error(core::StatusCode::kInvalidArgument, "missing credentials"));
   }
 
+  const auto realm_separator = req.username.find('@');
+  if (cfg_.krb5_realm.empty() ||
+      (realm_separator != std::string::npos &&
+       req.username.substr(realm_separator + 1) != cfg_.krb5_realm)) {
+    return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
+  }
+
   infra::Krb5Client krb(infra::Krb5Config{.realm = cfg_.krb5_realm});
   auto vr = krb.VerifyPasswordAndGetCcache(req.username, req.password);
   if (!vr.ok()) {
@@ -37,7 +44,13 @@ core::Result<std::optional<LoginPrincipal>> AuthService::Verify(const LoginReque
   }
 
   LoginPrincipal p;
-  p.uid = CanonicalUidFromUsername(req.username);
+  const std::string& verified_principal = vr.value().principal;
+  const auto separator = verified_principal.find('@');
+  if (separator == std::string::npos ||
+      verified_principal.substr(separator + 1) != cfg_.krb5_realm) {
+    return core::Result<std::optional<LoginPrincipal>>::Ok(std::nullopt);
+  }
+  p.uid = CanonicalUidFromUsername(verified_principal);
   p.tenant_id = "default";
   p.principal = vr.value().principal;
   p.tgt_expires_at = vr.value().tgt_expires_at;

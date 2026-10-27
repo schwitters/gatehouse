@@ -63,7 +63,7 @@ file(WRITE "${CROW_PATCH_SCRIPT}" "
 FetchContent_Declare(
   crow
   GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
-  GIT_TAG v1.3.0
+  GIT_TAG cfe92bb464cdc7ca08b403d8782ee8de99df3722 # v1.3.4
   PATCH_COMMAND ${CMAKE_COMMAND} -P "${CROW_PATCH_SCRIPT}"
 )
 FetchContent_MakeAvailable(crow)
@@ -201,7 +201,7 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   googletest
   GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.14.0
+  GIT_TAG 063de7e9578f82b369302001269680b4b1553359 # v1.18.0
 )
 FetchContent_MakeAvailable(googletest)
 
@@ -232,3 +232,21 @@ install(TARGETS gatehouse DESTINATION ${CMAKE_INSTALL_SBINDIR})
 install(DIRECTORY db/ DESTINATION /usr/share/gatehouse/db
         FILES_MATCHING PATTERN "*.sql")
 install(FILES data/gatehouse.service DESTINATION /lib/systemd/system/)
+
+add_executable(gatehouse_security_tests
+  tests/security_test.cc
+  src/app/http_utils.cc
+  src/app/auth.cc
+  src/infra/krb5_client.cc
+  src/core/result.cc
+)
+target_include_directories(gatehouse_security_tests PRIVATE include ${KRB5_INCLUDE_DIRS})
+target_link_libraries(gatehouse_security_tests PRIVATE
+  gatehouse_warnings Crow::Crow GTest::gtest_main ${KRB5_LIBRARIES})
+gtest_discover_tests(gatehouse_security_tests)
+add_test(NAME gatehouse_cli_smoke COMMAND gatehouse --help)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME gatehouse_http_security
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/security_http_test.py
+          $<TARGET_FILE:gatehouse> ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(gatehouse_http_security PROPERTIES TIMEOUT 30)

@@ -66,6 +66,12 @@ core::Result<void> HttpServer::Run() {
     if (!mk.ok()) return core::Result<void>::Err(mk.status());
     const std::vector<std::uint8_t> master_key = std::move(mk.value());
 
+    if (!cfg_.ldap_url.empty() && !cfg_.ldap_url.starts_with("ldaps://") &&
+        !cfg_.ldap_url.starts_with("ldapi://") && !cfg_.ldap_starttls) {
+      return core::Result<void>::Err(core::Status::Error(
+          core::StatusCode::kInvalidArgument, "LDAP requires LDAPS or StartTLS"));
+    }
+
     // Directory setup (LDAP preferred over LDIF).
     std::optional<infra::LdapDirectory> ldap_dir;
     infra::LdifDirectory ldif_dir;

@@ -22,6 +22,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Accept invite token -> invite_session cookie ----
   app.route_dynamic(B + "/invite/accept").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
     const char* t = req.url_params.get("token");
@@ -87,12 +88,14 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     auto r = RedirectTo(B + "/invite/complete");
     r.add_header("Set-Cookie", std::string(kInviteCookie) + "=" + s.sid +
-                               "; Path=" + cookie_path + "; Max-Age=1800; HttpOnly; SameSite=Lax");
+                               "; Path=" + cookie_path + "; Max-Age=1800; HttpOnly; SameSite=Lax" +
+                               (ctx.cfg.secure_cookies ? "; Secure" : ""));
     return r;
   });
 
   // ---- Complete invite wizard (GET) ----
   app.route_dynamic(B + "/invite/complete").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value())
@@ -117,7 +120,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const int wizard_step = verified ? 3 : (!sent.empty() ? 2 : 1);
 
     // Use the invite session SID as CSRF token: HttpOnly, embedded in HTML by server.
-    const std::string inv_csrf = crow::json::escape(is->sid);
+    const std::string inv_csrf = HtmlEscape(is->sid);
 
     auto wstep_class = [&](int n) -> std::string {
       if (n < wizard_step) return "wstep done";
@@ -127,7 +130,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     std::string html;
     html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>Complete Invitation \xe2\x80\x93 " + ctx.cfg.instance_title + "</title><style>";
+    html += "<title>Complete Invitation \xe2\x80\x93 " + HtmlEscape(ctx.cfg.instance_title) + "</title><style>";
     html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f0f4f9;color:#222}";
     html += ".wrap{max-width:520px;margin:48px auto;padding:0 16px}";
     html += "h1{font-size:1.5rem;margin:0 0 4px}";
@@ -153,7 +156,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "</style></head><body><div class='wrap'>";
 
     html += "<h1>Complete Invitation</h1>";
-    html += "<p class='subtitle'>Tenant: <b>" + crow::json::escape(row.tenant_id) + "</b> &nbsp;&middot;&nbsp; User: <b>" + crow::json::escape(row.invited_uid) + "</b></p>";
+    html += "<p class='subtitle'>Tenant: <b>" + HtmlEscape(row.tenant_id) + "</b> &nbsp;&middot;&nbsp; User: <b>" + HtmlEscape(row.invited_uid) + "</b></p>";
 
     html += "<div class='wizard'>";
     html += "<div class='" + wstep_class(1) + "'>1. Verify Email</div>";
@@ -165,8 +168,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "<div class='card'>";
       html += "<h2>Verify your email address</h2>";
       html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We'll send a 6-digit code to:</p>";
-      html += "<div class='info-row' style='margin-top:8px'><b>" + crow::json::escape(row.invited_email) + "</b></div>";
-      if (!err.empty()) html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
+      html += "<div class='info-row' style='margin-top:8px'><b>" + HtmlEscape(row.invited_email) + "</b></div>";
+      if (!err.empty()) html += "<div class='alert-err'>Error: " + HtmlEscape(err) + "</div>";
       html += "<form method='post' action='" + B + "/invite/otp/send'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<button type='submit' class='btn btn-primary'>Send Verification Code</button>";
@@ -174,8 +177,8 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     } else if (wizard_step == 2) {
       html += "<div class='card'>";
       html += "<h2>Enter verification code</h2>";
-      html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We sent a 6-digit code to <b>" + crow::json::escape(row.invited_email) + "</b>.<br>It expires in 10&nbsp;minutes.</p>";
-      if (!err.empty()) html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
+      html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>We sent a 6-digit code to <b>" + HtmlEscape(row.invited_email) + "</b>.<br>It expires in 10&nbsp;minutes.</p>";
+      if (!err.empty()) html += "<div class='alert-err'>Error: " + HtmlEscape(err) + "</div>";
       html += "<form method='post' action='" + B + "/invite/otp/verify'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<label>Verification code";
@@ -190,11 +193,11 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "<div class='card'>";
       html += "<h2>Set up your account</h2>";
       html += "<p style='color:#555;font-size:.93em;margin:8px 0 0'>Email verified. Choose a password to complete your registration.</p>";
-      if (!err.empty()) html += "<div class='alert-err'>Error: " + crow::json::escape(err) + "</div>";
+      if (!err.empty()) html += "<div class='alert-err'>Error: " + HtmlEscape(err) + "</div>";
       html += "<form method='post' action='" + B + "/invite/complete'>";
       html += "<input type='hidden' name='_csrf' value='" + inv_csrf + "'>";
       html += "<label>Display name <span style='color:#aaa;font-weight:400'>(optional)</span>";
-      html += "<input name='display_name' placeholder='Your full name' value='" + crow::json::escape(display) + "'></label>";
+      html += "<input name='display_name' placeholder='Your full name' value='" + HtmlEscape(display) + "'></label>";
       html += "<label>New password <span style='color:#b00020'>*</span>";
       html += "<input type='password' name='password' required minlength='8' autocomplete='new-password'></label>";
       html += "<label>Confirm password <span style='color:#b00020'>*</span>";
@@ -209,6 +212,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Complete invite wizard (POST) ----
   app.route_dynamic(B + "/invite/complete").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
@@ -268,9 +272,13 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     pr.created_at  = now;
     pr.updated_at  = now;
 
-    (void)ctx.invite_profiles.Upsert(pr);
-    (void)ctx.invites.UpdateStatus(is->invite_id, infra::InviteStatus::kCompleted, now);
-    (void)ctx.invite_sessions.Consume(is->sid, now);
+    const auto profile_result = ctx.invite_profiles.Upsert(pr);
+    if (!profile_result.ok()) return HtmlPage(500, "<h1>Profile storage failed</h1>");
+    const auto completion_result = ctx.invites.UpdateStatus(
+        is->invite_id, infra::InviteStatus::kCompleted, now);
+    if (!completion_result.ok()) return HtmlPage(500, "<h1>Invitation update failed</h1>");
+    const auto consume_result = ctx.invite_sessions.Consume(is->sid, now);
+    if (!consume_result.ok()) return HtmlPage(500, "<h1>Session update failed</h1>");
 
     // Activate user in LDAP.
     if (ctx.ldap_dir.has_value() && !inv.value()->invited_uid.empty()) {
@@ -284,7 +292,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     std::string done_html;
     done_html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-    done_html += "<title>Setup Complete \xe2\x80\x93 " + ctx.cfg.instance_title + "</title><style>";
+    done_html += "<title>Setup Complete \xe2\x80\x93 " + HtmlEscape(ctx.cfg.instance_title) + "</title><style>";
     done_html += "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f0f4f9;color:#222}";
     done_html += ".wrap{max-width:520px;margin:48px auto;padding:0 16px}";
     done_html += "h1{font-size:1.5rem;margin:0 0 4px}";
@@ -318,6 +326,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Send OTP email ----
   app.route_dynamic(B + "/invite/otp/send").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");
@@ -412,6 +421,7 @@ void RegisterInviteRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Verify OTP ----
   app.route_dynamic(B + "/invite/otp/verify").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto is = RequireInviteSession(ctx, req);
     if (!is.has_value()) return HtmlPage(401, "<h1>Invitation session expired</h1>");

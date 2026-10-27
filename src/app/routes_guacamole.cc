@@ -139,9 +139,6 @@ core::Result<std::string> BuildGuacData(
       connection_template, uid, token_hex, hostname, effective_host,
       protocol, port, expires_ms);
 
-  std::fprintf(stderr, "[gatehouse][guac] plaintext JSON for uid=%s host=%s: %s\n",
-               uid.c_str(), hostname.c_str(), json.c_str());
-
   const std::vector<std::uint8_t> plaintext(json.begin(), json.end());
 
   // Guacamole encrypted JSON format (matches Java UserDataService):
@@ -151,13 +148,6 @@ core::Result<std::string> BuildGuacData(
   //   4. encrypt = AesCBC(full_key, NULL_IV, signed_payload)
   //   5. output = Base64(ciphertext)
   const std::vector<std::uint8_t> full_key = DecodeGuacSecret(guacamole_secret);
-
-  {
-    std::string k;
-    for (std::uint8_t b : full_key) { char buf[3]; std::snprintf(buf,3,"%02x",b); k+=buf; }
-    std::fprintf(stderr, "[gatehouse][guac] secret_len=%zu full_key_len=%zu full_key=%s\n",
-                 guacamole_secret.size(), full_key.size(), k.c_str());
-  }
 
   auto hmac = core::HmacSha256(full_key, plaintext);
   if (!hmac.ok()) return core::Result<std::string>::Err(hmac.status());
@@ -171,13 +161,7 @@ core::Result<std::string> BuildGuacData(
   auto enc = core::AesCbcEncryptWithIv(full_key, null_iv, signed_payload);
   if (!enc.ok()) return core::Result<std::string>::Err(enc.status());
 
-  std::fprintf(stderr, "[gatehouse][guac] signed_payload_len=%zu encrypted_len=%zu\n",
-               signed_payload.size(), enc.value().size());
-
   const std::string data = core::Base64Encode(enc.value());
-  std::fprintf(stderr, "[gatehouse][guac] base64 payload for uid=%s host=%s: %s\n",
-               uid.c_str(), hostname.c_str(), data.c_str());
-
   return core::Result<std::string>::Ok(std::move(data));
 }
 
@@ -197,6 +181,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // Response (JSON):     {"ok": true, "url": "..."}
   app.route_dynamic(B + "/api/me/guacamole-session")
       .methods("POST"_method)([&ctx, &B, connection_template](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"] = false; v["error"] = "unauthenticated";
@@ -339,6 +324,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // This fixes the stale-sessionStorage problem that forces users to open a new browser.
   app.route_dynamic(B + "/guac-launch")
       .methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string ticket_id = req.url_params.get("t")
         ? std::string(req.url_params.get("t")) : "";
     if (ticket_id.empty()) {
@@ -390,6 +376,7 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // The Kerberos ticket is deleted from the vault after retrieval (one-time use).
   app.route_dynamic(B + "/api/cred-fetch/ticket")
       .methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string token_hex = req.url_params.get("token") ?
         req.url_params.get("token") : "";
     const std::string uid       = req.url_params.get("uid")   ?

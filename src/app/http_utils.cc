@@ -4,12 +4,27 @@
 
 namespace gatehouse::app {
 
+std::string HtmlEscape(const std::string& value) {
+  std::string escaped;
+  for (const char ch : value) {
+    switch (ch) {
+      case '&': escaped += "&amp;"; break;
+      case '<': escaped += "&lt;"; break;
+      case '>': escaped += "&gt;"; break;
+      case '"': escaped += "&quot;"; break;
+      case '\'': escaped += "&#39;"; break;
+      default: escaped += ch; break;
+    }
+  }
+  return escaped;
+}
+
 std::string ApplyTitle(const char* tmpl, const std::string& title) {
   std::string out = tmpl;
   const std::string placeholder = "%TITLE%";
   std::size_t pos = 0;
   while ((pos = out.find(placeholder, pos)) != std::string::npos) {
-    out.replace(pos, placeholder.size(), title);
+    out.replace(pos, placeholder.size(), HtmlEscape(title));
     pos += title.size();
   }
   return out;

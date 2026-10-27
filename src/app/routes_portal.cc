@@ -16,6 +16,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Root redirect ----
   app.route_dynamic(B + "/").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -24,6 +25,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Portal dashboard ----
   app.route_dynamic(B + "/portal").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -39,7 +41,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     }
 
     std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-    html += "<title>" + ctx.cfg.instance_title + " Portal</title>";
+    html += "<title>" + HtmlEscape(ctx.cfg.instance_title) + " Portal</title>";
     html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:760px;background:#f9f9f9;color:#222}";
     html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:24px}";
     html += "h1{margin-top:0} .host-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-top:16px}";
@@ -48,12 +50,12 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "button{padding:10px 16px;border:none;border-radius:6px;background:#0b57d0;color:#fff;cursor:pointer;font-weight:600}";
     html += "button:hover{background:#0842a0} a{color:#0b57d0;text-decoration:none;font-weight:600} a:hover{text-decoration:underline}";
     html += "</style></head><body>";
-    html += "<h1>" + ctx.cfg.instance_title + " Portal</h1>";
+    html += "<h1>" + HtmlEscape(ctx.cfg.instance_title) + " Portal</h1>";
 
     // Card: User Info
     html += "<div class=\"card\"><h3>Identity</h3>";
-    html += "<p>Signed in as <b>" + crow::json::escape(s->uid) + "</b><br>";
-    html += "Tenant: <code>" + crow::json::escape(s->tenant_id) + "</code></p>";
+    html += "<p>Signed in as <b>" + HtmlEscape(s->uid) + "</b><br>";
+    html += "Tenant: <code>" + HtmlEscape(s->tenant_id) + "</code></p>";
     if (!admin_block.empty()) html += admin_block;
     html += "</div>";
 
@@ -157,6 +159,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // ---- Change password (GET + POST) ----
   app.route_dynamic(B + "/portal/changepw").methods("GET"_method, "POST"_method)(
       [&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -164,7 +167,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     if (req.method == "GET"_method) {
       const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
       std::string html = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-      html += "<title>Change Password \xe2\x80\x93 " + ctx.cfg.instance_title + "</title>";
+      html += "<title>Change Password \xe2\x80\x93 " + HtmlEscape(ctx.cfg.instance_title) + "</title>";
       html += "<style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:540px;background:#f9f9f9;color:#222}";
       html += ".card{background:#fff;padding:24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.05)}";
       html += "label{display:block;margin-top:16px;font-weight:500;font-size:0.95em} input{width:100%;padding:10px;margin-top:6px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}";
@@ -174,7 +177,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
       html += "<p><a href=\"" + B + "/portal\">&larr; Back to Dashboard</a></p>";
       html += "<h1>Change Password</h1>";
       html += "<div class=\"card\">";
-      if (!err.empty()) html += "<div style=\"color:#b00020;background:#fce8e6;padding:12px;border-radius:8px;margin-bottom:16px\"><b>Error:</b> " + crow::json::escape(err) + "</div>";
+      if (!err.empty()) html += "<div style=\"color:#b00020;background:#fce8e6;padding:12px;border-radius:8px;margin-bottom:16px\"><b>Error:</b> " + HtmlEscape(err) + "</div>";
       html += "<form method=\"post\" action=\"" + B + "/portal/changepw\">";
       html += "<input type=\"hidden\" name=\"_csrf\" value=\"" + s->csrf_secret_hex + "\">";
       html += "<label>Old Password <input type=\"password\" name=\"old_password\" required autofocus></label>";
@@ -218,6 +221,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- API: current user info ----
   app.route_dynamic(B + "/api/me").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v);
@@ -232,6 +236,7 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- API: user's managed hosts ----
   app.route_dynamic(B + "/api/me/hosts").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v);

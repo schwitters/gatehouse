@@ -9,6 +9,8 @@
 
 namespace gatehouse::app {
 
+[[nodiscard]] std::string HtmlEscape(const std::string& value);
+
 // Replace all occurrences of %TITLE% in `tmpl` with `title`.
 std::string ApplyTitle(const char* tmpl, const std::string& title);
 

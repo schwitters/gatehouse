@@ -44,6 +44,7 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- HTML login page ----
   app.route_dynamic(B + "/login").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     const std::string err = req.url_params.get("err") ? req.url_params.get("err") : "";
     std::string page = ApplyTitle(kLoginPageTemplate, ctx.cfg.instance_title);
@@ -51,7 +52,7 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::size_t bp = page.find("%B%");
     if (bp != std::string::npos) page.replace(bp, 3, B);
     if (!err.empty()) {
-      const std::string block = std::string("<div class=\"err\">") + crow::json::escape(err) + "</div>";
+      const std::string block = std::string("<div class=\"err\">") + HtmlEscape(err) + "</div>";
       const std::size_t pos = page.find("%ERROR%");
       if (pos != std::string::npos) page.replace(pos, 7, block);
     } else {
@@ -63,6 +64,7 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Logout ----
   app.route_dynamic(B + "/auth/logout").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
     auto s = RequireAuth(ctx, req);
@@ -80,13 +82,9 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- HTML form login ----
   app.route_dynamic(B + "/auth/login").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
-    if (!ctx.rate_limiter.Check(req.remote_ip_address)) {
-      std::fprintf(stderr, "[gatehouse][login] rate-limited ip=%s\n",
-                   SanitizeForLog(req.remote_ip_address).c_str());
-      return RedirectTo(B + "/login?err=Too+many+login+attempts.+Please+try+again+in+5+minutes.");
-    }
 
     const std::optional<std::string> u = core::FormGet(req.body, "username");
     const std::optional<std::string> p = core::FormGet(req.body, "password");
@@ -94,6 +92,15 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     LoginRequest lr;
     lr.username = u.value_or("");
     lr.password = p.value_or("");
+
+    std::string account_key = lr.username;
+    const std::string realm_suffix = "@" + ctx.cfg.auth_cfg.krb5_realm;
+    if (account_key.ends_with(realm_suffix)) {
+      account_key.resize(account_key.size() - realm_suffix.size());
+    }
+    if (!ctx.rate_limiter.Check(account_key)) {
+      return HtmlPage(429, "<h1>Too many login attempts</h1>");
+    }
 
     auto vr = ctx.auth.Verify(lr);
     if (!vr.ok() || !vr.value().has_value()) {
@@ -155,19 +162,15 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
                      "; Path=" + cookie_path + "; Max-Age=" + std::to_string(ctx.cfg.session_ttl_seconds) +
                      "; HttpOnly; SameSite=Lax" +
                      (ctx.cfg.secure_cookies ? "; Secure" : ""));
-    SetCsrfCookie(r, core::HexEncode(csrf_bytes.value()), ctx.cfg.session_ttl_seconds, B);
+    SetCsrfCookie(r, core::HexEncode(csrf_bytes.value()), ctx.cfg.session_ttl_seconds, B, ctx.cfg.secure_cookies);
     return r;
   });
 
   // ---- JSON login API ----
   app.route_dynamic(B + "/api/auth/login").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     const std::string cookie_path = B.empty() ? "/" : B + "/";
-    if (!ctx.rate_limiter.Check(req.remote_ip_address)) {
-      std::fprintf(stderr, "[gatehouse][api/login] rate-limited ip=%s\n",
-                   SanitizeForLog(req.remote_ip_address).c_str());
-      crow::json::wvalue v; v["ok"]=false; v["error"]="too many login attempts"; return Json(429, v);
-    }
 
     auto body = crow::json::load(req.body);
     if (!body) {
@@ -177,6 +180,18 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     LoginRequest lr;
     if (body.has("username")) lr.username = std::string(body["username"].s());
     if (body.has("password")) lr.password = std::string(body["password"].s());
+
+    std::string account_key = lr.username;
+    const std::string realm_suffix = "@" + ctx.cfg.auth_cfg.krb5_realm;
+    if (account_key.ends_with(realm_suffix)) {
+      account_key.resize(account_key.size() - realm_suffix.size());
+    }
+    if (!ctx.rate_limiter.Check(account_key)) {
+      crow::json::wvalue error;
+      error["ok"] = false;
+      error["error"] = "too many login attempts";
+      return Json(429, error);
+    }
 
     auto vr = ctx.auth.Verify(lr);
     if (!vr.ok() || !vr.value().has_value()) {
@@ -244,7 +259,7 @@ void RegisterAuthRoutes(crow::SimpleApp& app, ServerContext& ctx) {
                         "; Path=" + cookie_path + "; Max-Age=" + std::to_string(ctx.cfg.session_ttl_seconds) +
                         "; HttpOnly; SameSite=Lax" +
                         (ctx.cfg.secure_cookies ? "; Secure" : ""));
-    SetCsrfCookie(resp, core::HexEncode(csrf_bytes.value()), ctx.cfg.session_ttl_seconds, B);
+    SetCsrfCookie(resp, core::HexEncode(csrf_bytes.value()), ctx.cfg.session_ttl_seconds, B, ctx.cfg.secure_cookies);
     return resp;
   });
 }
