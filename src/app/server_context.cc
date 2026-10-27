@@ -50,15 +50,23 @@ core::Result<GuacLaunchTicket> GuacLaunchStore::Consume(
 
 bool LoginRateLimiter::Check(const std::string& ip) {
   std::lock_guard<std::mutex> lk(mu);
-  if (attempts.size() >= kMapMaxSize && attempts.find(ip) == attempts.end()) {
-    return false;
+  const std::int64_t cleanup_time = core::UnixNow();
+  if (attempts.size() >= kMapMaxSize) {
+    for (auto it = attempts.begin(); it != attempts.end();) {
+      if (cleanup_time - it->second.second > kWindowSecs) {
+        it = attempts.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (attempts.size() >= kMapMaxSize && !attempts.contains(ip)) return false;
   }
   auto& entry = attempts[ip];
   const std::int64_t now_ts = core::UnixNow();
   if (now_ts - entry.second > kWindowSecs) {
     entry = {0, now_ts};
   }
-  entry.first++;
+  if (entry.first < kMaxAttempts + 1) ++entry.first;
   return entry.first <= kMaxAttempts;
 }
 
@@ -108,6 +116,13 @@ std::optional<infra::InviteSessionRow> RequireInviteSession(
   const infra::InviteSessionRow& row = *got.value();
   if (row.expires_at <= core::UnixNow()) return std::nullopt;
   if (row.consumed_at != 0) return std::nullopt;
+  const auto invite = ctx.invites.GetById(row.invite_id);
+  if (!invite.ok() || !invite.value().has_value()) return std::nullopt;
+  const auto& invitation = *invite.value();
+  if (invitation.expires_at <= core::UnixNow() || invitation.revoked_at != 0 ||
+      invitation.status == infra::InviteStatus::kRevoked ||
+      invitation.status == infra::InviteStatus::kCompleted ||
+      invitation.status == infra::InviteStatus::kExpired) return std::nullopt;
   return row;
 }
 
@@ -140,11 +155,11 @@ bool CsrfOkHeader(const crow::request& req, const infra::SessionRow& s) {
 }
 
 void SetCsrfCookie(crow::response& r, const std::string& csrf_hex,
-                   std::int64_t max_age, const std::string& base_uri) {
+                   std::int64_t max_age, const std::string& base_uri, bool secure) {
   const std::string path = base_uri.empty() ? "/" : base_uri + "/";
   r.add_header("Set-Cookie",
                "gh_csrf=" + csrf_hex + "; Path=" + path + "; Max-Age=" +
-                   std::to_string(max_age) + "; SameSite=Strict");
+                   std::to_string(max_age) + "; SameSite=Strict" + (secure ? "; Secure" : ""));
 }
 
 core::Result<std::string> StoreTicketIfPresent(ServerContext& ctx,

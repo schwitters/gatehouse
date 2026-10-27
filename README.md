@@ -23,7 +23,7 @@ It serves both a browser UI and a JSON API over HTTP via the [Crow](https://crow
 
 **Operating system:** Debian/Ubuntu (tested). Other Linux distributions should work with equivalent packages.
 
-**Build tools:** `cmake` (3.14+), a C++20-capable compiler (GCC 10+ or Clang 12+), `make` or `ninja`.
+**Build tools:** `cmake` (3.24+), a C++20-capable compiler (GCC 10+ or Clang 12+), `make` or `ninja`.
 
 **System libraries:**
 
@@ -83,7 +83,7 @@ The server listens on `http://0.0.0.0:18080` by default. Open that address in a 
 
 ### Demo mode (no Kerberos)
 
-If you omit `--realm`, Gatehouse falls back to demo mode, which accepts any username/password. Useful for local development.
+A Kerberos realm must be configured for authentication. Missing realm configuration rejects logins; arbitrary-password demo authentication is not supported.
 
 ---
 
@@ -143,6 +143,7 @@ export GATEHOUSE_SMTP_URL="smtps://mail.example.com:465"
     --realm EXAMPLE.COM \
     --port 18080 \
     --ldap-url ldap://dc.example.com \
+    --ldap-starttls \
     --ldap-bind-dn "uid=svc-gatehouse,cn=users,dc=example,dc=com" \
     --ldap-bind-pw "ldappassword" \
     --ldap-base-dn "dc=example,dc=com" \

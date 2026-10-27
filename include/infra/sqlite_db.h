@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "core/result.h"
@@ -13,6 +14,11 @@ namespace gatehouse::infra {
 class SqliteDb final {
  public:
   SqliteDb() = default;
+
+  // Hold across a complete request so shared-connection transactions cannot interleave.
+  [[nodiscard]] std::unique_lock<std::mutex> LockRequest() {
+    return std::unique_lock<std::mutex>(request_mutex_);
+  }
   ~SqliteDb();
 
   SqliteDb(const SqliteDb&) = delete;
@@ -36,6 +42,7 @@ class SqliteDb final {
  private:
   static core::Status MakeSqliteStatus(int rc, sqlite3* db, std::string_view what);
 
+  std::mutex request_mutex_;
   sqlite3* db_{nullptr};
   std::string path_;
 };

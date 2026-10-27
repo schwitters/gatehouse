@@ -115,6 +115,13 @@ static core::Result<void> SendMailSmtps(const std::string& smtp_url,
                                                       "curl_easy_init failed"));
   }
 
+  constexpr long kConnectTimeoutSeconds = 10;
+  constexpr long kTransferTimeoutSeconds = 30;
+  if (curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSeconds) != CURLE_OK ||
+      curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, kTransferTimeoutSeconds) != CURLE_OK) {
+    return core::Result<void>::Err(core::Status::Error(
+        core::StatusCode::kInternal, "failed to configure SMTP timeouts"));
+  }
   curl_easy_setopt(curl.get(), CURLOPT_URL, smtp_url.c_str());
   curl_easy_setopt(curl.get(), CURLOPT_USERNAME, username.c_str());
   curl_easy_setopt(curl.get(), CURLOPT_PASSWORD, app_password.c_str());

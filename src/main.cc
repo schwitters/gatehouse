@@ -35,7 +35,7 @@ void PrintUsage(const char* argv0) {
       << "Invitations:\n"
       << "  --public-base-url URL  Base URL for invite links (default: http://127.0.0.1:18080)\n"
       << "  --invite-ttl SECONDS   Invite link lifetime (default: 604800)\n"
-      << "  --admin-uids CSV       Comma-separated UIDs with admin access (default: demo)\n"
+      << "  --admin-uids CSV       Comma-separated UIDs with admin access (default: none)\n"
       << "  --ldap-admin-group DN  LDAP group DN whose members get admin access\n"
       << "  --email-backend MODE   Email delivery: console (default) | curl\n"
       << "\n"

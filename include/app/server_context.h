@@ -50,7 +50,7 @@ struct GuacLaunchStore {
   [[nodiscard]] core::Result<GuacLaunchTicket> Consume(const std::string& id, std::int64_t now);
 };
 
-// Per-IP login rate limiter.  Max 10 attempts per 5-minute window.
+// Per-account login rate limiter. Max 10 attempts per 5-minute window.
 // MED-07: Hard cap on map size to prevent memory exhaustion from IP spoofing.
 struct LoginRateLimiter {
   static constexpr int kMaxAttempts = 10;
@@ -110,7 +110,7 @@ bool CsrfOkHeader(const crow::request& req, const infra::SessionRow& s);
 // Sets the JS-readable gh_csrf cookie (no HttpOnly, intentional).
 // base_uri: used to scope the cookie Path (e.g. "/gatehouse" → Path=/gatehouse/).
 void SetCsrfCookie(crow::response& r, const std::string& csrf_hex,
-                   std::int64_t max_age, const std::string& base_uri = "");
+                   std::int64_t max_age, const std::string& base_uri, bool secure);
 
 // SHA-256 of a remote IP string (for session IP binding).
 std::vector<std::uint8_t> HashRemoteIp(const std::string& ip);

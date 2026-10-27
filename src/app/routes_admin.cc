@@ -325,6 +325,7 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Admin invitations page ----
   app.route_dynamic(B + "/admin/invites").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -341,6 +342,7 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
   // ---- Admin tenant/user overview page ----
   app.route_dynamic(B + "/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -349,7 +351,7 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     const std::string csrf = s->csrf_secret_hex;
     std::string html = "<!doctype html><html><head><meta charset='utf-8'>"
                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                       "<title>" + ctx.cfg.instance_title + " \xe2\x80\x93 Tenant Overview</title>"
+                       "<title>" + HtmlEscape(ctx.cfg.instance_title) + " \xe2\x80\x93 Tenant Overview</title>"
                        "<style>"
                        "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:1100px;background:#f9f9f9;color:#222}"
                        ".card{background:#fff;padding:20px 24px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.05);margin-bottom:20px}"
@@ -575,6 +577,7 @@ loadTenants();
 
   // ---- API: List uninvited users ----
   app.route_dynamic(B + "/api/admin/uninvited").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -616,6 +619,7 @@ loadTenants();
 
   // ---- API: List latest invites (with optional filters) ----
   app.route_dynamic(B + "/api/admin/invites/list").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -650,6 +654,7 @@ loadTenants();
 
   // ---- API: Revoke invite ----
   app.route_dynamic(B + "/api/admin/invites/revoke").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -686,6 +691,7 @@ loadTenants();
 
   // ---- API: Create invite ----
   app.route_dynamic(B + "/api/admin/invites").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     try {
       auto s = RequireAuth(ctx, req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
@@ -800,6 +806,7 @@ loadTenants();
 
   // ---- API: Kerberos attribute status for a user ----
   app.route_dynamic(B + "/api/admin/user/krb-status").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -824,6 +831,7 @@ loadTenants();
 
   // ---- API: Reset Kerberos attributes for a user ----
   app.route_dynamic(B + "/api/admin/user/reset-krb").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -852,6 +860,7 @@ loadTenants();
 
   // ---- API: Reset invitation (revoke all + delete krb attrs + new invite) ----
   app.route_dynamic(B + "/api/admin/user/reset-invite").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -951,6 +960,7 @@ loadTenants();
 
   // ---- API: List tenants ----
   app.route_dynamic(B + "/api/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -975,6 +985,7 @@ loadTenants();
 
   // ---- API: List users with hosts for a tenant ----
   app.route_dynamic(B + "/api/admin/tenant-users").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto request_lock = ctx.db.LockRequest();
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
