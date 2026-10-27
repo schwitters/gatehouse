@@ -1,4 +1,5 @@
 #include "app/routes.h"
+#include "web_assets.h"
 
 #include <cstdio>
 #include <string>
@@ -18,314 +19,17 @@ namespace gatehouse::app {
 
 namespace {
 
-const char* kAdminInvitesPage = R"ADMIN(<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>%TITLE% – Invitations</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:980px}
-    label{display:block;margin-top:14px}
-    input{width:100%;padding:10px;margin-top:6px}
-    button{margin-top:12px;padding:10px 14px}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-    .card{padding:16px;border:1px solid #ddd;border-radius:12px;margin-top:18px}
-    code{background:#f4f4f4;padding:2px 6px;border-radius:6px}
-    pre{background:#0b1020;color:#e6e6e6;padding:12px;border-radius:12px;overflow:auto}
-    .ok{color:#0a7a2f}
-    .err{color:#b00020}
-    a{color:#0b57d0}
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;font-size:14px}
-    th{font-weight:600}
-    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f4f4f4}
-  </style>
-</head>
-<body>
-  <h1>Invitations</h1>
-  <p><a href="%B%/portal">Back to portal</a></p>
-
-  <div class="card">
-    <h2>Create invite</h2>
-    <div class="row">
-      <div>
-        <label>Tenant OU (e.g. <code>k8s-20260118</code>)
-          <input id="tenant_ou" placeholder="k8s-20260118" autocomplete="off">
-        </label>
-      </div>
-      <div>
-        <label>User UID (e.g. <code>krm</code>)
-          <input id="uid" placeholder="krm" autocomplete="off">
-        </label>
-      </div>
-    </div>
-    <button id="btnCreate">Create invite</button>
-    <p id="statusCreate"></p>
-    <div id="outCreate"></div>
-  </div>
-
-  <div class="card">
-    <h2>Uninvited LDAP Users</h2>
-    <div class="row">
-      <div>
-        <label>Target Tenant OU
-          <input id="uninvTenant" placeholder="k8s-20260118">
-        </label>
-      </div>
-    </div>
-    <button id="btnSearchUninvited">Find Users</button>
-    <p id="statusUninvited"></p>
-    <div id="uninvitedList"></div>
-  </div>
-
-  <div class="card">
-    <h2>Latest invites</h2>
-    <div class="row">
-      <div>
-        <label>Filter tenant_ou
-          <input id="fltTenant" placeholder="(optional)">
-        </label>
-      </div>
-      <div>
-        <label>Filter uid
-          <input id="fltUid" placeholder="(optional)">
-        </label>
-      </div>
-    </div>
-    <button id="btnRefresh">Refresh list</button>
-    <p id="statusList"></p>
-    <div id="list"></div>
-  </div>
-
-<script>
-const _B='%B%';
-function getCsrfToken() {
-  const m = document.cookie.match(/(?:^|;\s*)gh_csrf=([^;]+)/);
-  return m ? m[1] : '';
-}
-
-async function apiJson(method, path, body) {
-  const opt = {method, headers: {"Content-Type":"application/json", "X-CSRF-Token": getCsrfToken()}};
-  if (body !== undefined) opt.body = JSON.stringify(body);
-  const r = await fetch(_B+path, opt);
-  const t = await r.text();
-  let j = null;
-  try { j = JSON.parse(t); } catch(e) {}
-  return {ok: r.ok, status: r.status, json: j, text: t};
-}
-
-function setStatus(id, kind, msg) {
-  const el = document.getElementById(id);
-  el.className = kind;
-  el.textContent = msg;
-}
-
-function renderJson(where, obj) {
-  const out = document.getElementById(where);
-  out.innerHTML = "";
-  const pre = document.createElement("pre");
-  pre.textContent = JSON.stringify(obj, null, 2);
-  out.appendChild(pre);
-  if (obj && obj.invite_url) {
-    const p = document.createElement("p");
-    const a = document.createElement("a");
-    a.href = obj.invite_url;
-    a.textContent = "Open invite link";
-    a.target = "_blank";
-    p.appendChild(a);
-    out.appendChild(p);
-  }
-}
-
-function renderList(items) {
-  const root = document.getElementById("list");
-  root.innerHTML = "";
-  if (!items || items.length === 0) {
-    root.textContent = "No invites.";
-    return;
-  }
-  const table = document.createElement("table");
-  const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>created / dates</th><th>tenant</th><th>uid</th><th>email</th><th>status</th><th>actions</th></tr>";
-  table.appendChild(thead);
-  const tbody = document.createElement("tbody");
-  for (const it of items) {
-    const tr = document.createElement("tr");
-
-    const created = new Date(it.created_at * 1000).toLocaleString();
-    const expires = new Date(it.expires_at * 1000).toLocaleString();
-    let datesHtml = "<div>" + created + "</div><div style='color:#555;font-size:0.85em;margin-top:4px'>Expires: " + expires + "</div>";
-
-    if (it.consumed_at && it.consumed_at > 0) {
-        datesHtml += "<div style='color:#0a7a2f;font-size:0.85em'>Completed: " + new Date(it.consumed_at * 1000).toLocaleString() + "</div>";
-    }
-    if (it.revoked_at && it.revoked_at > 0) {
-        datesHtml += "<div style='color:#b00020;font-size:0.85em'>Revoked: " + new Date(it.revoked_at * 1000).toLocaleString() + "</div>";
-    }
-
-    let pillColor = "#f4f4f4";
-    let textColor = "#000";
-    if (it.status_name === "Completed") { pillColor = "#e6f4ea"; textColor = "#137333"; }
-    else if (it.status_name === "Revoked" || it.status_name === "Expired") { pillColor = "#fce8e6"; textColor = "#c5221f"; }
-    else if (it.status_name === "StepupVerified") { pillColor = "#e8f0fe"; textColor = "#1a73e8"; }
-
-    tr.innerHTML =
-      "<td>" + datesHtml + "</td>" +
-      "<td><code>" + it.tenant_id + "</code></td>" +
-      "<td><code>" + (it.invited_uid||"") + "</code></td>" +
-      "<td>" + it.invited_email + "</td>" +
-      "<td><span class='pill' style='background:" + pillColor + ";color:" + textColor + ";font-weight:500'>" + it.status_name + "</span></td>" +
-      "<td></td>";
-    const td = tr.querySelectorAll("td")[5];
-
-    const canRevoke = it.status !== 4 && it.status !== 5 && it.status !== 6;
-
-    if (canRevoke) {
-      const btnRevoke = document.createElement("button");
-      btnRevoke.textContent = "Revoke";
-      btnRevoke.style.marginRight = "8px";
-      btnRevoke.onclick = async () => {
-        if (!confirm("Are you sure you want to revoke this invitation for " + it.invited_email + "?")) return;
-        const r = await apiJson("POST", "/api/admin/invites/revoke", {invite_id: it.invite_id});
-        if (!r.ok) { alert("Revoke failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
-        await refresh();
-      };
-      td.appendChild(btnRevoke);
-    } else if (it.invited_uid && it.tenant_id) {
-      checkAndAddResetBtn(td, it.tenant_id, it.invited_uid);
-    }
-
-    const btnResend = document.createElement("button");
-    btnResend.textContent = "Resend";
-    btnResend.onclick = async () => {
-      if (!confirm("Generate a new invite link for " + it.invited_email + "?")) return;
-      const r = await apiJson("POST", "/api/admin/invites", {tenant_ou: it.tenant_id, uid: it.invited_uid});
-      if (!r.ok) { alert("Resend failed: " + (r.json && r.json.error ? r.json.error : r.text)); return; }
-      renderJson("outCreate", r.json || {});
-      setStatus("statusCreate", "ok", "Resent as new invite.");
-      await refresh();
-    };
-    td.appendChild(btnResend);
-
-    tbody.appendChild(tr);
-  }
-  table.appendChild(tbody);
-  root.appendChild(table);
-}
-
-async function checkAndAddResetBtn(td, tenant_id, uid) {
-  try {
-    const r = await apiJson("GET", "/api/admin/user/krb-status?tenant_id=" + encodeURIComponent(tenant_id) + "&uid=" + encodeURIComponent(uid));
-    if (!r.ok || !r.json || !r.json.has_krb_attrs) return;
-    const btn = document.createElement("button");
-    btn.textContent = "Reset Kerberos";
-    btn.style.cssText = "margin-right:8px;background:#d93025;";
-    btn.onclick = async () => {
-      if (!confirm("Delete Kerberos attributes for " + uid + "?\n\nThis removes: krbPrincipalName, krbPrincipalKey, krbExtraData, krbLastPwdChange, krbLoginFailedCount")) return;
-      const res = await apiJson("POST", "/api/admin/user/reset-krb", {tenant_id, uid});
-      if (!res.ok) { alert("Reset failed: " + (res.json && res.json.error ? res.json.error : res.text)); return; }
-      btn.remove();
-    };
-    td.insertBefore(btn, td.firstChild);
-  } catch(e) {}
-}
-
-async function refresh() {
-  setStatus("statusList", "", "Loading...");
-  const t = document.getElementById("fltTenant").value.trim();
-  const u = document.getElementById("fltUid").value.trim();
-  const q = new URLSearchParams();
-  if (t) q.set("tenant_id", t);
-  if (u) q.set("invited_uid", u);
-  const r = await fetch(_B+"/api/admin/invites/list?" + q.toString());
-  const j = await r.json().catch(() => null);
-  if (!r.ok) {
-    setStatus("statusList", "err", "Error (" + r.status + ")");
-    return;
-  }
-  setStatus("statusList", "ok", "Loaded " + (j.items ? j.items.length : 0) + " invite(s).");
-  renderList(j.items || []);
-}
-
-async function searchUninvited() {
-  setStatus("statusUninvited", "", "Searching LDAP...");
-  const t = document.getElementById("uninvTenant").value.trim();
-  if (!t) { setStatus("statusUninvited", "err", "Please enter a Tenant OU."); return; }
-
-  const r = await fetch(_B+"/api/admin/uninvited?tenant_id=" + encodeURIComponent(t));
-  const j = await r.json().catch(() => null);
-  if (!r.ok) { setStatus("statusUninvited", "err", "Error: " + (j && j.error ? j.error : r.status)); return; }
-
-  const items = j.items || [];
-  setStatus("statusUninvited", "ok", "Found " + items.length + " uninvited user(s).");
-
-  const root = document.getElementById("uninvitedList");
-  root.innerHTML = "";
-  if (items.length === 0) return;
-
-  const table = document.createElement("table");
-  table.innerHTML = "<thead><tr><th>uid</th><th>email</th><th>actions</th></tr></thead>";
-  const tbody = document.createElement("tbody");
-
-  for (const it of items) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = "<td><code>" + it.uid + "</code></td><td>" + it.mail + "</td><td></td>";
-    const td = tr.querySelectorAll("td")[2];
-
-    const btn = document.createElement("button");
-    btn.textContent = "Send Invite";
-    btn.onclick = async () => {
-      btn.disabled = true;
-      btn.textContent = "Sending...";
-      const res = await apiJson("POST", "/api/admin/invites", {tenant_ou: t, uid: it.uid});
-      if (!res.ok) {
-        alert("Failed: " + (res.json && res.json.error ? res.json.error : res.text));
-        btn.disabled = false;
-        btn.textContent = "Send Invite";
-      } else {
-        btn.textContent = "Sent!";
-        await refresh();
-      }
-    };
-    td.appendChild(btn);
-    tbody.appendChild(tr);
-  }
-  table.appendChild(tbody);
-  root.appendChild(table);
-}
-document.getElementById("btnSearchUninvited").addEventListener("click", searchUninvited);
-
-document.getElementById("btnCreate").addEventListener("click", async () => {
-  const tenant_ou = document.getElementById("tenant_ou").value.trim();
-  const uid = document.getElementById("uid").value.trim();
-  if (!tenant_ou || !uid) { setStatus("statusCreate","err","tenant_ou and uid are required"); return; }
-  setStatus("statusCreate","", "Working...");
-  const r = await apiJson("POST", "/api/admin/invites", {tenant_ou, uid});
-  if (!r.ok) {
-    setStatus("statusCreate","err","Error ("+r.status+"): " + (r.json && r.json.error ? r.json.error : r.text));
-    if (r.json) renderJson("outCreate", r.json);
-    return;
-  }
-  setStatus("statusCreate","ok","Invite created and email queued/sent.");
-  renderJson("outCreate", r.json || {});
-  await refresh();
-});
-
-document.getElementById("btnRefresh").addEventListener("click", refresh);
-refresh();
-</script>
-</body>
-</html>)ADMIN";
+const char* kAdminInvitesPage = assets::k_admin_invites;
 
 }  // namespace
 
 void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
-  const std::string& B = ctx.cfg.base_uri;
+  const std::string& base_uri = ctx.cfg.base_uri;
 
   // ---- Admin invitations page ----
-  app.route_dynamic(B + "/admin/invites").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/admin/invites").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -341,8 +45,9 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Admin tenant/user overview page ----
-  app.route_dynamic(B + "/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -379,205 +84,16 @@ void RegisterAdminRoutes(crow::SimpleApp& app, ServerContext& ctx) {
 
     html += "const _B='" + B + "';\n";
     html += "const CSRF = '" + csrf + "';\n";
-    html += R"JS(
-const STATUS_NAMES = {
-  '-1': {label:'None',      bg:'#f0f0f0', fg:'#555'},
-   '0': {label:'Invited',   bg:'#fff3cd', fg:'#856404'},
-   '1': {label:'LinkVerified', bg:'#cfe2ff', fg:'#0a58ca'},
-   '2': {label:'StepupSent',   bg:'#cfe2ff', fg:'#0a58ca'},
-   '3': {label:'StepupVerified', bg:'#d1ecf1', fg:'#0c5460'},
-   '4': {label:'Completed', bg:'#d1e7dd', fg:'#0f5132'},
-   '5': {label:'Expired',   bg:'#f8d7da', fg:'#842029'},
-   '6': {label:'Revoked',   bg:'#f8d7da', fg:'#842029'},
-};
+    html += "</script><script src=\"" + HtmlEscape(B) + "/assets/admin-tenants.js\"></script><script>";
 
-function statusPill(status, expiresAt) {
-  const s = String(status);
-  const info = STATUS_NAMES[s] || {label:'Unknown', bg:'#eee', fg:'#333'};
-  let label = info.label;
-  if ((status === 0 || status === 1 || status === 2 || status === 3) && expiresAt > 0 && expiresAt < Date.now()/1000) {
-    label = 'Expired'; return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:#f8d7da;color:#842029">' + label + '</span>';
-  }
-  return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:' + info.bg + ';color:' + info.fg + '">' + label + '</span>';
-}
-
-async function loadTenants() {
-  const r = await fetch(_B+'/api/admin/tenants');
-  const j = await r.json().catch(() => null);
-  const sel = document.getElementById('tenantSel');
-  if (!r.ok || !j || !j.items) { sel.innerHTML = '<option>Error loading tenants</option>'; return; }
-  sel.innerHTML = '<option value="">-- choose tenant --</option>';
-  for (const t of j.items) {
-    const o = document.createElement('option');
-    o.value = t; o.textContent = t;
-    sel.appendChild(o);
-  }
-}
-
-async function sendInvite(tenantId, uid, btnEl) {
-  btnEl.disabled = true;
-  const orig = btnEl.textContent;
-  btnEl.textContent = 'Sending...';
-  const r = await fetch(_B+'/api/admin/invites', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
-    body: JSON.stringify({tenant_ou: tenantId, uid})
-  });
-  const j = await r.json().catch(() => null);
-  if (!r.ok) {
-    alert('Failed: ' + (j && j.error ? j.error : r.status));
-    btnEl.disabled = false;
-    btnEl.textContent = orig;
-    return;
-  }
-  await loadUsers();
-}
-
-async function resetKrb(tenantId, uid, btnEl) {
-  if (!confirm('Kerberos-Attribute für "' + uid + '" löschen?')) return;
-  btnEl.disabled = true;
-  const orig = btnEl.textContent;
-  btnEl.textContent = '...';
-  const r = await fetch(_B+'/api/admin/user/reset-krb', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
-    body: JSON.stringify({tenant_id: tenantId, uid})
-  });
-  const j = await r.json().catch(() => null);
-  if (!r.ok) alert('Fehler: ' + (j && j.error ? j.error : r.status));
-  btnEl.disabled = false;
-  btnEl.textContent = orig;
-}
-
-async function resetInvite(tenantId, uid, btnEl) {
-  if (!confirm('Alle Einladungen für "' + uid + '" zurücksetzen, E-Mail aktualisieren und neu einladen?')) return;
-  btnEl.disabled = true;
-  const orig = btnEl.textContent;
-  btnEl.textContent = '...';
-  const r = await fetch(_B+'/api/admin/user/reset-invite', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json','X-CSRF-Token': CSRF},
-    body: JSON.stringify({tenant_id: tenantId, uid})
-  });
-  const j = await r.json().catch(() => null);
-  if (!r.ok) {
-    alert('Fehler: ' + (j && j.error ? j.error : r.status));
-    btnEl.disabled = false;
-    btnEl.textContent = orig;
-    return;
-  }
-  await loadUsers();
-}
-
-async function loadUsers() {
-  const t = document.getElementById('tenantSel').value;
-  if (!t) { document.getElementById('status').textContent = 'Please select a tenant.'; return; }
-  document.getElementById('status').textContent = 'Loading...';
-  document.getElementById('result').innerHTML = '';
-  const r = await fetch(_B+'/api/admin/tenant-users?tenant_id=' + encodeURIComponent(t),
-                        {headers: {'X-CSRF-Token': CSRF}});
-  const j = await r.json().catch(() => null);
-  if (!r.ok || !j) {
-    document.getElementById('status').textContent = 'Error: ' + (j && j.error ? j.error : r.status);
-    return;
-  }
-  const users = j.users || [];
-  document.getElementById('status').textContent = users.length + ' user(s) found.';
-
-  if (users.length === 0) {
-    document.getElementById('result').innerHTML = '<div class="card"><p>No users found in this tenant.</p></div>';
-    return;
-  }
-
-  const card = document.createElement('div');
-  card.className = 'card';
-  card.innerHTML = '<h2>Users in <code>' + escHtml(t) + '</code></h2>';
-
-  const table = document.createElement('table');
-  table.innerHTML =
-    '<thead><tr><th>UID</th><th>First Name</th><th>Last Name</th><th>Email</th>' +
-    '<th>Invitation</th><th>Managed Hosts</th><th>Actions</th></tr></thead>';
-  const tbody = document.createElement('tbody');
-
-  for (const u of users) {
-    const tr = document.createElement('tr');
-
-    let hostsHtml = '';
-    if (u.hosts && u.hosts.length > 0) {
-      for (const h of u.hosts) {
-        hostsHtml += '<span class="host-pill" title="' + escHtml(h.dn) + '">';
-        hostsHtml += escHtml(h.hostname || h.dn);
-        if (h.ip) hostsHtml += ' <code>' + escHtml(h.ip) + '</code>';
-        hostsHtml += '</span>';
-      }
-    } else {
-      hostsHtml = '<span class="muted">\xe2\x80\x94</span>';
-    }
-
-    const st = u.invite_status;
-    let invHtml = statusPill(st, u.invite_expires_at);
-    if (st >= 0 && u.invite_created_at > 0) {
-      invHtml += '<br><span class="muted">' + new Date(u.invite_created_at * 1000).toLocaleDateString() + '</span>';
-    }
-    if (u.invite_expires_at > 0 && st !== 4) {
-      const exp = new Date(u.invite_expires_at * 1000);
-      invHtml += '<br><span class="muted" title="Expires">exp: ' + exp.toLocaleDateString() + '</span>';
-    }
-
-    tr.innerHTML =
-      '<td><code>' + escHtml(u.uid) + '</code></td>' +
-      '<td>' + escHtml(u.given_name) + '</td>' +
-      '<td>' + escHtml(u.surname) + '</td>' +
-      '<td>' + escHtml(u.mail) + '</td>' +
-      '<td>' + invHtml + '</td>' +
-      '<td>' + hostsHtml + '</td>' +
-      '<td></td>';
-
-    const td = tr.querySelectorAll('td')[6];
-    td.style.cssText = 'white-space:nowrap';
-    const isActive = st === 0 || st === 1 || st === 2 || st === 3;
-    const isCompleted = st === 4;
-    const btnStyle = 'padding:4px 8px;font-size:12px;border:none;border-radius:4px;cursor:pointer;margin:2px;';
-    if (!isCompleted) {
-      const btn = document.createElement('button');
-      btn.textContent = isActive ? 'Resend' : 'Send Invite';
-      btn.style.cssText = btnStyle;
-      btn.onclick = () => sendInvite(t, u.uid, btn);
-      td.appendChild(btn);
-    }
-    const krbBtn = document.createElement('button');
-    krbBtn.textContent = 'Kerberos Reset';
-    krbBtn.style.cssText = btnStyle + 'background:#fd7e14;color:#fff;';
-    krbBtn.onclick = () => resetKrb(t, u.uid, krbBtn);
-    td.appendChild(krbBtn);
-    const riBtn = document.createElement('button');
-    riBtn.textContent = 'Reset Invitation';
-    riBtn.style.cssText = btnStyle + 'background:#0b57d0;color:#fff;';
-    riBtn.onclick = () => resetInvite(t, u.uid, riBtn);
-    td.appendChild(riBtn);
-
-    tbody.appendChild(tr);
-  }
-  table.appendChild(tbody);
-  card.appendChild(table);
-  document.getElementById('result').appendChild(card);
-}
-
-function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-document.getElementById('btnLoad').addEventListener('click', loadUsers);
-loadTenants();
-)JS";
     html += "</script></body></html>";
     return HtmlPage(200, html);
   });
 
   // ---- API: List uninvited users ----
-  app.route_dynamic(B + "/api/admin/uninvited").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/uninvited").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -618,8 +134,9 @@ loadTenants();
   });
 
   // ---- API: List latest invites (with optional filters) ----
-  app.route_dynamic(B + "/api/admin/invites/list").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/invites/list").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -653,8 +170,9 @@ loadTenants();
   });
 
   // ---- API: Revoke invite ----
-  app.route_dynamic(B + "/api/admin/invites/revoke").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/invites/revoke").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -683,6 +201,10 @@ loadTenants();
         std::fprintf(stderr, "[gatehouse][ldap] revoke: DeleteKrbAttributes failed for %s/%s: %s\n",
                      inv_tenant_id.c_str(), inv_uid.c_str(),
                      del_rc.status().ToString().c_str());
+        crow::json::wvalue error;
+        error["ok"] = false;
+        error["error"] = "Invitation revoked, but directory cleanup failed; retry revocation";
+        return Json(502, error);
       }
     }
 
@@ -690,8 +212,9 @@ loadTenants();
   });
 
   // ---- API: Create invite ----
-  app.route_dynamic(B + "/api/admin/invites").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/invites").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     try {
       auto s = RequireAuth(ctx, req);
       if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
@@ -751,7 +274,8 @@ loadTenants();
       }
 
       // Revoke any existing pending invites before creating a new one.
-      (void)ctx.invites.RevokePending(tenant_ou, uid, core::UnixNow());
+      auto revoked = ctx.invites.RevokePending(tenant_ou, uid, core::UnixNow());
+      if (!revoked.ok()) { crow::json::wvalue error; error["error"] = "Invitation is busy"; return Json(409, error); }
 
       auto token_bytes    = core::RandomBytes(32);
       auto invite_id_bytes = core::RandomBytes(16);
@@ -805,8 +329,9 @@ loadTenants();
   });
 
   // ---- API: Kerberos attribute status for a user ----
-  app.route_dynamic(B + "/api/admin/user/krb-status").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/user/krb-status").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -830,8 +355,9 @@ loadTenants();
   });
 
   // ---- API: Reset Kerberos attributes for a user ----
-  app.route_dynamic(B + "/api/admin/user/reset-krb").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/user/reset-krb").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -848,6 +374,8 @@ loadTenants();
       crow::json::wvalue v; v["ok"]=false; v["error"]="tenant_id/uid empty"; return Json(400, v);
     }
 
+    auto revoked = ctx.invites.RevokeAll(tenant_id, uid, core::UnixNow());
+    if (!revoked.ok()) { crow::json::wvalue error; error["error"] = "Invitation is busy"; return Json(409, error); }
     auto rc = ctx.ldap_dir->DeleteKrbAttributes(tenant_id, uid);
     if (!rc.ok()) {
       std::fprintf(stderr, "[gatehouse][ldap] reset-krb failed for %s/%s: %s\n",
@@ -859,8 +387,9 @@ loadTenants();
   });
 
   // ---- API: Reset invitation (revoke all + delete krb attrs + new invite) ----
-  app.route_dynamic(B + "/api/admin/user/reset-invite").methods("POST"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/user/reset-invite").methods("POST"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }
@@ -887,7 +416,8 @@ loadTenants();
     const std::int64_t now = core::UnixNow();
 
     // 1. Revoke all invites (including completed).
-    (void)ctx.invites.RevokeAll(tenant_id, uid, now);
+    auto revoked = ctx.invites.RevokeAll(tenant_id, uid, now);
+    if (!revoked.ok()) { crow::json::wvalue error; error["error"] = "Invitation is busy"; return Json(409, error); }
 
     // 2. Delete Kerberos attributes so the principal can be recreated.
     if (ctx.ldap_dir.has_value()) {
@@ -959,8 +489,9 @@ loadTenants();
   });
 
   // ---- API: List tenants ----
-  app.route_dynamic(B + "/api/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/tenants").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!IsAdminUid(ctx, s->uid)) { crow::json::wvalue v; v["ok"]=false; v["error"]="forbidden"; return Json(403, v); }
@@ -984,8 +515,9 @@ loadTenants();
   });
 
   // ---- API: List users with hosts for a tenant ----
-  app.route_dynamic(B + "/api/admin/tenant-users").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/admin/tenant-users").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) { crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v); }
     if (!CsrfOkHeader(req, *s)) { crow::json::wvalue v; v["ok"]=false; v["error"]="invalid csrf token"; return Json(403, v); }

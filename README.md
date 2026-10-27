@@ -77,7 +77,7 @@ export GATEHOUSE_MASTER_KEY_HEX=$(openssl rand -hex 32)
 ./build/gatehouse --db gatehouse.db --realm EXAMPLE.COM
 ```
 
-> **Important:** Run the binary from the project root directory. The database migration SQL files (`db/schema_v1.sql` … `db/schema_v5.sql`) must be reachable relative to the current working directory.
+> **Important:** Run the binary from the project root directory. The database migration SQL files (`db/schema_v1.sql` … `db/schema_v7.sql`) must be reachable relative to the current working directory.
 
 The server listens on `http://0.0.0.0:18080` by default. Open that address in a browser to see the login page.
 
@@ -199,6 +199,12 @@ src/core/       Pure utilities (crypto, result type, hex, SHA-256, …)
 src/app/        HTTP routing, auth service, email, server context
 src/infra/      I/O: SQLite repositories, Kerberos client, LDAP/LDIF
 include/        Headers mirroring the same three-layer structure
-db/             SQL migration files (schema_v1.sql … schema_v5.sql)
+db/             SQL migration files (schema_v1.sql … schema_v7.sql)
 tests/          Unit tests
 ```
+
+## Provisioning recovery and production checks
+
+See [Production readiness](doc/production-readiness.md) for schema version 7,
+checkpoint recovery, worker database connections, CI and disposable-service
+staging tests.

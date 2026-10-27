@@ -5,3 +5,6 @@ build-test/
 .deb-staging/
 build-deb/
 *.deb
+
+__pycache__/
+*.py[cod]

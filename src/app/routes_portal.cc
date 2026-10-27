@@ -12,11 +12,12 @@
 namespace gatehouse::app {
 
 void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
-  const std::string& B = ctx.cfg.base_uri;
+  const std::string& base_uri = ctx.cfg.base_uri;
 
   // ---- Root redirect ----
-  app.route_dynamic(B + "/").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -24,8 +25,9 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- Portal dashboard ----
-  app.route_dynamic(B + "/portal").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/portal").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -95,71 +97,18 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
     html += "<script>";
     html += "const _B='" + B + "';";
     html += "const _GUAC_PROTOS=" + guac_protos_js + ";";
-    html += "function getCsrfToken(){var m=document.cookie.match(/(^|;)\\s*gh_csrf=([^;]+)/);return m?decodeURIComponent(m[2]):''}";
-    // Each Connect click generates a fresh encrypted JSON token via the API.
-    // The btn parameter is disabled during the request to prevent double-clicks.
-    html += "async function connectHost(hostname,protocol,btn){";
-    html += "  var lbl=(protocol==='rdp')?'Connect (RDP)':'Connect (SSH)';";
-    html += "  if(btn){btn.disabled=true;btn.textContent='Connecting\u2026';}";
-    // Open blank tab immediately on user click — before any async work —
-    // so popup blockers see a direct user-gesture origin.
-    html += "  var w=window.open('','_blank');";
-    html += "  if(!w){if(btn){btn.disabled=false;btn.textContent=lbl;}alert('Popup blocked. Please allow popups for this page.');return;}";
-    html += "  const r=await fetch(_B+'/api/me/guacamole-session',{method:'POST',";
-    html += "    headers:{'Content-Type':'application/json','X-CSRF-Token':getCsrfToken()},";
-    html += "    body:JSON.stringify({hostname:hostname,protocol:protocol})});";
-    html += "  const j=await r.json();";
-    html += "  if(!r.ok||!j.ok){w.close();if(btn){btn.disabled=false;btn.textContent=lbl;}alert('Connect failed: '+(j.error||r.status));return;}";
-    // Navigate the already-open blank tab to the relay page.
-    // The relay page clears stale GUAC_AUTH_TOKEN then redirects to /#/?data=...
-    // so Guacamole always processes the fresh encrypted JSON.
-    html += "  w.location.replace(j.launch_url);";
-    html += "  if(btn){setTimeout(function(){btn.disabled=false;btn.textContent=lbl;},4000);}";
-    html += "}";
-    html += "async function loadHosts() {";
-    html += "  const r = await fetch(_B+'/api/me/hosts');";
-    html += "  const div = document.getElementById('hostContainer');";
-    html += "  if (!r.ok) { div.innerHTML = '<p style=\"color:#b00020\">Failed to load hosts.</p>'; return; }";
-    html += "  const j = await r.json();";
-    html += "  if (!j.items || j.items.length === 0) { div.innerHTML = '<p>No managed hosts assigned to you.</p>'; return; }";
-    html += "  const grid = document.createElement('div');";
-    html += "  grid.className = 'host-grid';";
-    html += "  for(const host of j.items) {";
-    html += "    const card = document.createElement('div');";
-    html += "    card.className = 'host-card';";
-    html += "    const b = document.createElement('b');";
-    html += "    b.textContent = host.hostname || 'Unknown Host';";
-    html += "    const p = document.createElement('p');";
-    html += "    p.style.cssText = 'margin:8px 0 0 0';";
-    html += "    const code = document.createElement('code');";
-    html += "    code.textContent = host.ip || 'No IP configured';";
-    html += "    p.appendChild(code);";
-    html += "    const proto=(host.protocol==='rdp')?'rdp':'ssh';";
-    html += "    card.appendChild(b);";
-    html += "    card.appendChild(p);";
-    html += "    if(_GUAC_PROTOS.indexOf(proto)!==-1){";
-    html += "      const btn=document.createElement('button');";
-    html += "      btn.textContent=(proto==='rdp')?'Connect (RDP)':'Connect (SSH)';";
-    html += "      btn.style.cssText='margin-top:10px;padding:6px 12px;font-size:0.85em;width:100%;background:#1a6b38';";
-    html += "      btn.onclick=function(e){connectHost(host.hostname||'',proto,e.currentTarget);};";
-    html += "      card.appendChild(btn);";
-    html += "    }";
-    html += "    grid.appendChild(card);";
-    html += "  }";
-    html += "  div.innerHTML = '';";
-    html += "  div.appendChild(grid);";
-    html += "}";
-    html += "loadHosts();";
-    html += "</script>";
+    html += "</script><script src=\"" + HtmlEscape(B) + "/assets/portal.js\"></script>";
+
 
     html += "</body></html>";
     return HtmlPage(200, html);
   });
 
   // ---- Change password (GET + POST) ----
-  app.route_dynamic(B + "/portal/changepw").methods("GET"_method, "POST"_method)(
+  app.route_dynamic(base_uri + "/portal/changepw").methods("GET"_method, "POST"_method)(
       [&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string& B = ctx.cfg.base_uri;
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) return RedirectTo(B + "/login");
@@ -220,8 +169,9 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- API: current user info ----
-  app.route_dynamic(B + "/api/me").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/me").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v);
@@ -235,8 +185,9 @@ void RegisterPortalRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   });
 
   // ---- API: user's managed hosts ----
-  app.route_dynamic(B + "/api/me/hosts").methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/me/hosts").methods("GET"_method)([&ctx](const crow::request& req) {
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"]=false; v["error"]="unauthenticated"; return Json(401, v);

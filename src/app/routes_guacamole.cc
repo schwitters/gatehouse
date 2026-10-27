@@ -169,7 +169,7 @@ core::Result<std::string> BuildGuacData(
 }  // namespace
 
 void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
-  const std::string& B = ctx.cfg.base_uri;
+  const std::string& base_uri = ctx.cfg.base_uri;
   const std::string connection_template =
       LoadConnectionTemplate(ctx.cfg.guac_connection_template_path);
 
@@ -179,9 +179,11 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   //
   // Request body (JSON): {"hostname": "...", "protocol": "rdp"|"ssh"}
   // Response (JSON):     {"ok": true, "url": "..."}
-  app.route_dynamic(B + "/api/me/guacamole-session")
-      .methods("POST"_method)([&ctx, &B, connection_template](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+  app.route_dynamic(base_uri + "/api/me/guacamole-session")
+      .methods("POST"_method)([&ctx, connection_template](const crow::request& req) {
+    const std::string& B = ctx.cfg.base_uri;
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     auto s = RequireAuth(ctx, req);
     if (!s.has_value()) {
       crow::json::wvalue v; v["ok"] = false; v["error"] = "unauthenticated";
@@ -322,9 +324,10 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // Relay page: exchanges the launch ticket for a Guacamole authToken client-side,
   // explicitly writes sessionStorage.GUAC_AUTH, then navigates to the connection.
   // This fixes the stale-sessionStorage problem that forces users to open a new browser.
-  app.route_dynamic(B + "/guac-launch")
+  app.route_dynamic(base_uri + "/guac-launch")
       .methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string ticket_id = req.url_params.get("t")
         ? std::string(req.url_params.get("t")) : "";
     if (ticket_id.empty()) {
@@ -374,9 +377,10 @@ void RegisterGuacamoleRoutes(crow::SimpleApp& app, ServerContext& ctx) {
   // Query params: token=<hex>, uid=<uid>, host=<hostname>
   // Returns: {"ok": true, "ccache_b64": "<base64>"}
   // The Kerberos ticket is deleted from the vault after retrieval (one-time use).
-  app.route_dynamic(B + "/api/cred-fetch/ticket")
+  app.route_dynamic(base_uri + "/api/cred-fetch/ticket")
       .methods("GET"_method)([&ctx](const crow::request& req) {
-    const auto request_lock = ctx.db.LockRequest();
+    const auto connection = ctx.db.ConnectForThread();
+    if (!connection.ok()) return HtmlPage(503, "<h1>Database unavailable</h1>");
     const std::string token_hex = req.url_params.get("token") ?
         req.url_params.get("token") : "";
     const std::string uid       = req.url_params.get("uid")   ?

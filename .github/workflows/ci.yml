@@ -1,0 +1,56 @@
+name: Build and security checks
+on:
+  push:
+    branches: [main, 'work/**']
+  pull_request:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      run_staging:
+        description: Run against disposable external staging services
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizers: ['OFF', 'ON']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsqlite3-dev libkrb5-dev libldap2-dev libssl-dev libcurl4-openssl-dev libboost-system-dev libboost-date-time-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DGATEHOUSE_ENABLE_ASAN=${{ matrix.sanitizers }} -DGATEHOUSE_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Audit exact fetched dependency commits
+        if: matrix.sanitizers == 'OFF'
+        run: python3 scripts/check-dependencies.py build
+      - name: Record system package versions
+        if: always()
+        run: dpkg-query -W libsqlite3-0 libkrb5-3 libldap2 libssl3t64 libcurl4t64 || dpkg-query -W
+  staging:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_staging
+    runs-on: [self-hosted, gatehouse-staging]
+    environment: staging
+    env:
+      GATEHOUSE_STAGING_CONFIG: ${{ vars.GATEHOUSE_STAGING_CONFIG }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require disposable service configuration
+        run: test -n "$GATEHOUSE_STAGING_CONFIG" && test -r "$GATEHOUSE_STAGING_CONFIG"
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DGATEHOUSE_WARNINGS_AS_ERRORS=ON
+          cmake --build build --parallel 2
+      - name: Test real integrations
+        run: ctest --test-dir build -L staging --output-on-failure
